@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nexus-inference-engine
+  namespace: default
+  labels:
+    app: nexus-inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nexus-inference
+  template:
+    metadata:
+      labels:
+        app: nexus-inference
+    spec:
+      hostIPC: true
+      containers:
+      - name: nexus-worker
+        image: nexus-inference-engine:latest
+        imagePullPolicy: IfNotPresent
+        resources:
+          limits:
+            nvidia.com/gpu: "2"
+            memory: "64Gi"
+            cpu: "16"
+          requests:
+            nvidia.com/gpu: "2"
+            memory: "32Gi"
+            cpu: "8"
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+        ports:
+        - containerPort: 8000
+          name: http
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus-inference-service
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app: nexus-inference
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
