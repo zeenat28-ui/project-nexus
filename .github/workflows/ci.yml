@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-typecheck:
+    name: Lint, Lockfile & Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv and verify lockfile integrity
+        run: |
+          python -m pip install --upgrade pip uv
+          uv lock --check
+
+      - name: Install package and dev dependencies
+        run: |
+          python -m pip install -e ".[dev]"
+
+      - name: Run Ruff lint
+        run: ruff check src tests
+
+      - name: Run Ruff format check
+        run: ruff format --check src tests
+
+      - name: Run Mypy
+        run: mypy src
+
+  test:
+    name: Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run pytest (CPU-only, no GPU required)
+        run: pytest --cov=project_nexus --cov-report=term-missing
+
+  package-and-cli-smoke:
+    name: Package Build & CLI Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+          python -m build
+          twine check dist/*
+
+      - name: Install built wheel into clean venv and smoke-test CLI
+        run: |
+          python -m venv /tmp/nexus-smoke
+          /tmp/nexus-smoke/bin/pip install dist/*.whl
+          /tmp/nexus-smoke/bin/nexus version
+          /tmp/nexus-smoke/bin/nexus check-config --config config/nexus.mock.yaml
+          /tmp/nexus-smoke/bin/nexus probe --config config/nexus.mock.yaml
+          /tmp/nexus-smoke/bin/nexus verify-backend --config config/nexus.mock.yaml --iterations 2
+          /tmp/nexus-smoke/bin/nexus detect-gpu --json
+
+  validate-kubernetes:
+    name: Validate Kubernetes Base & HA Manifests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install kubeconform v0.6.7 and kustomize v5.5.0
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kubeconform
+          curl -fsSL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.5.0/kustomize_v5.5.0_linux_amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kustomize
+
+      - name: Validate base and HA Kustomize renders
+        run: |
+          kustomize build deploy/kubernetes/base | kubeconform -strict -summary
+          kustomize build deploy/kubernetes/overlays/ha | kubeconform -strict -summary
+          kubeconform -strict -summary deploy/kubernetes/secret.example.yaml
+
+  docker-build-and-scan:
+    name: Docker Build, Vulnerability Scan & SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build gateway container image
+        run: docker build -t project-nexus:ci-test .
+
+      - name: Verify non-root container CLI smoke commands
+        run: |
+          docker run --rm project-nexus:ci-test version
+          docker run --rm project-nexus:ci-test check-config --config /etc/nexus/nexus.mock.yaml
+          docker run --rm project-nexus:ci-test verify-backend --config /etc/nexus/nexus.mock.yaml --iterations 2
+
+      - name: Run Trivy filesystem & image scan and generate SPDX SBOM
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "project-nexus:ci-test"
+          format: "spdx-json"
+          output: "project-nexus-sbom.spdx.json"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"
+          ignore-unfixed: true
+
+      - name: Upload SPDX SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-nexus-sbom
+          path: project-nexus-sbom.spdx.json

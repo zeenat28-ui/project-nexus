@@ -1,0 +1,52 @@
+# Example ConfigMap for Project Nexus in Kubernetes.
+# Adjust backend.base_url and backend.model to point at your separately deployed
+# inference backend (for example, a vLLM CUDA or ROCm Deployment in the cluster).
+# Do NOT store API keys or bearer tokens in this ConfigMap.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nexus-gateway-config
+  labels:
+    app.kubernetes.io/name: nexus-gateway
+    app.kubernetes.io/version: "0.1.0"
+data:
+  nexus.yaml: |
+    server:
+      host: "0.0.0.0"
+      port: 8000
+      shutdown_drain_seconds: 15.0
+
+    backend:
+      type: "openai_compatible"
+      base_url: "http://llm-inference-backend.inference.svc.cluster.local:8000"
+      model: "Qwen/Qwen2.5-7B-Instruct"
+      api_style: "chat_completions"
+      health_path: "/health"
+      connect_timeout_seconds: 5.0
+      read_timeout_seconds: 30.0
+      verify_tls: true
+
+    limits:
+      max_request_bytes: 65536
+      max_prompt_chars: 16384
+      max_tokens_limit: 2048
+      request_timeout_seconds: 35.0
+      health_check_timeout_seconds: 3.0
+      max_concurrent_requests: 64
+      rate_limit_requests_per_minute: 300
+      rate_limit_burst: 50
+
+    circuit_breaker:
+      failure_threshold: 3
+      cooldown_seconds: 15.0
+
+    logging:
+      level: "INFO"
+      format: "json"
+
+    metrics:
+      # Bound to a dedicated internal port (not exposed on the client Service).
+      # Requires NEXUS_METRICS_BEARER_TOKEN from the Kubernetes Secret plus NetworkPolicy.
+      mode: "separate"
+      host: "0.0.0.0"
+      port: 9090

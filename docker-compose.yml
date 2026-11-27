@@ -1,0 +1,37 @@
+# Local development stack running Project Nexus against the deterministic mock backend.
+# Binds only to host loopback (127.0.0.1) so unauthenticated local dev endpoints
+# are not exposed on your LAN.
+#
+# To connect to an external GPU inference backend (for example, a separately
+# deployed CUDA or ROCm vLLM server), override the environment variables below:
+#   NEXUS_BACKEND_TYPE=openai_compatible
+#   NEXUS_BACKEND_BASE_URL=http://host.docker.internal:8001
+#   NEXUS_BACKEND_MODEL=<your-served-model-id>
+#   NEXUS_AUTH_API_KEY=<local-gateway-token>
+
+services:
+  nexus-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: project-nexus:0.1.0-local
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      NEXUS_SERVER_HOST: "0.0.0.0"
+      NEXUS_SERVER_PORT: "8000"
+      NEXUS_BACKEND_TYPE: "${NEXUS_BACKEND_TYPE:-mock}"
+      NEXUS_BACKEND_MODEL: "${NEXUS_BACKEND_MODEL:-mock-llm-v1}"
+      NEXUS_LOG_LEVEL: "${NEXUS_LOG_LEVEL:-INFO}"
+      NEXUS_LOG_FORMAT: "${NEXUS_LOG_FORMAT:-json}"
+      NEXUS_METRICS_MODE: "separate"
+      NEXUS_METRICS_HOST: "127.0.0.1"
+      NEXUS_METRICS_PORT: "9090"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped

@@ -1,0 +1,55 @@
+# Example default-deny-style NetworkPolicy for Project Nexus.
+# Requires a Kubernetes CNI that enforces NetworkPolicy (for example, Cilium or Calico).
+# Adjust namespace and pod label selectors to match your cluster topology.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nexus-gateway
+  labels:
+    app.kubernetes.io/name: nexus-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: nexus-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow gateway HTTP traffic only from authorized ingress/client pods.
+    - from:
+        - podSelector:
+            matchLabels:
+              nexus.project/client: "true"
+      ports:
+        - protocol: TCP
+          port: 8000
+    # Allow metrics scraping only from the monitoring namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090
+  egress:
+    # Allow cluster DNS resolution.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow traffic to the upstream LLM inference backend service.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: inference
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: llm-inference-backend
+      ports:
+        - protocol: TCP
+          port: 8000

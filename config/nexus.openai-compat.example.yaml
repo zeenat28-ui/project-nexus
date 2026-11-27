@@ -1,0 +1,62 @@
+# Example configuration connecting Project Nexus to an external OpenAI-compatible
+# inference server (such as vLLM on NVIDIA CUDA or AMD ROCm, SGLang, or llama.cpp).
+#
+# Do NOT put real credentials in this file. Supply secrets via environment variables:
+#   NEXUS_AUTH_API_KEY          - Primary bearer token required on /v1/* endpoints
+#   NEXUS_AUTH_API_KEYS         - Optional comma-separated additional tokens for key rotation
+#   NEXUS_BACKEND_API_KEY       - Bearer token forwarded to the upstream inference server
+#   NEXUS_METRICS_BEARER_TOKEN  - Bearer token required when scraping /metrics
+#
+# For OIDC/JWT validation instead of static API keys, set:
+#   NEXUS_AUTH_MODE=jwt
+#   NEXUS_AUTH_JWT_JWKS_URL=https://idp.example.internal/.well-known/jwks.json
+#   NEXUS_AUTH_JWT_ISSUER=https://idp.example.internal
+#   NEXUS_AUTH_JWT_AUDIENCE=project-nexus
+
+server:
+  host: "127.0.0.1"
+  port: 8000
+  shutdown_drain_seconds: 15.0
+
+backend:
+  type: "openai_compatible"
+  base_url: "http://127.0.0.1:8001"
+  model: "Qwen/Qwen2.5-7B-Instruct"
+  api_style: "chat_completions"   # or "completions"
+  health_path: "/health"          # vLLM/SGLang use /health; some servers use /v1/models
+  connect_timeout_seconds: 5.0
+  read_timeout_seconds: 30.0
+  verify_tls: true
+  # ca_bundle_path: "/etc/ssl/certs/custom-ca.pem"
+  # Upstream mTLS client certificate + key (must be set as a pair):
+  # client_cert_path: "/etc/nexus/tls/client.crt"
+  # client_key_path: "/etc/nexus/tls/client.key"
+  max_connections: 100
+  max_keepalive_connections: 20
+
+limits:
+  max_request_bytes: 65536
+  max_prompt_chars: 16384
+  max_tokens_limit: 2048
+  request_timeout_seconds: 35.0
+  health_check_timeout_seconds: 3.0
+  max_concurrent_requests: 64
+  rate_limit_requests_per_minute: 120
+  rate_limit_burst: 20
+
+circuit_breaker:
+  failure_threshold: 3
+  cooldown_seconds: 15.0
+
+logging:
+  level: "INFO"
+  format: "json"
+
+tracing:
+  enabled: false
+  service_name: "project-nexus"
+
+metrics:
+  mode: "separate"
+  host: "127.0.0.1"
+  port: 9090

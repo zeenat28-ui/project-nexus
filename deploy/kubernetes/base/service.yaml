@@ -1,0 +1,18 @@
+# Internal ClusterIP Service exposing only the gateway HTTP port (8000).
+# The metrics port (9090) is intentionally excluded from this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus-gateway
+  labels:
+    app.kubernetes.io/name: nexus-gateway
+    app.kubernetes.io/component: gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nexus-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
