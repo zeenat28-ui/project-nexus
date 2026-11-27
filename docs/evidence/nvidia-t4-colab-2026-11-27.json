@@ -1,0 +1,65 @@
+{
+  "recorded_at_utc": "2026-11-27T05:23:00Z",
+  "platform": "Google Colab (Linux)",
+  "notebook": "notebooks/colab_cuda_verification.ipynb",
+  "commit_tested": "d8079aa",
+  "environment": {
+    "torch_version": "2.14.0+cu130",
+    "cuda_version": "13.0",
+    "vllm_version": "0.34.0",
+    "model": "Qwen/Qwen2.5-1.5B-Instruct"
+  },
+  "gpu": {
+    "vendor": "nvidia",
+    "available": true,
+    "tool": "/opt/bin/nvidia-smi",
+    "driver_version": "580.82.07",
+    "devices": [
+      {
+        "index": 0,
+        "name": "Tesla T4",
+        "vendor": "nvidia",
+        "memory_total_mib": 15360
+      }
+    ],
+    "diagnostics": []
+  },
+  "verify_backend": {
+    "overall_passed": true,
+    "checks": [
+      {
+        "name": "health_check",
+        "passed": true,
+        "detail": "Upstream health endpoint returned HTTP 200.",
+        "latency_ms": 59.97
+      },
+      {
+        "name": "generate_non_streaming",
+        "passed": true,
+        "detail": "Completed 5 non-streaming request(s).",
+        "latency_ms": 459.04
+      },
+      {
+        "name": "generate_streaming",
+        "passed": true,
+        "detail": "Received 6 chunk(s); ttft_ms=107.02, total_ms=316.48.",
+        "latency_ms": 316.48
+      }
+    ],
+    "latency_summary": {
+      "samples": 5,
+      "min_ms": 238.37,
+      "p50_ms": 242.3,
+      "p95_ms": 1245.18,
+      "max_ms": 1245.18
+    }
+  },
+  "gateway_e2e": {
+    "readyz": "ready",
+    "auth_enforced": true,
+    "generate_latency_ms": 201.05,
+    "generate_output_preview": "Verified with CUDA.",
+    "chat_sse_passed": true,
+    "metrics_verified": true
+  }
+}

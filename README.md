@@ -1,5 +1,8 @@
 # Project Nexus
 
+[![CI](https://github.com/zeenat28-ui/project-nexus/actions/workflows/ci.yml/badge.svg)](https://github.com/zeenat28-ui/project-nexus/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 Project Nexus is a lightweight LLM serving integration and operations gateway written in Python (`v0.2.0`). It provides a consistent HTTP API (including SSE streaming and OpenAI-compatible chat endpoints), multi-backend model routing with per-backend circuit breakers and optional failover, health/readiness probes with graceful shutdown draining, validated configuration, rotatable API-key and OIDC/JWT authentication, in-memory or Redis cluster-wide rate limits, structured logs, optional OpenTelemetry OTLP tracing, and Prometheus metrics in front of external LLM inference servers.
 
 ## What Nexus Does — and Does Not Do
@@ -181,6 +184,7 @@ Project Nexus itself runs as a CPU-only Python gateway container and connects ov
 
 - Upstream reference: [vLLM OpenAI-Compatible Server (CUDA)](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html)
 - Reproducible Colab verification notebook: [`notebooks/colab_cuda_verification.ipynb`](notebooks/colab_cuda_verification.ipynb)
+- Raw recorded JSON evidence: [`docs/evidence/nvidia-t4-colab-2026-11-27.json`](docs/evidence/nvidia-t4-colab-2026-11-27.json)
 
 **Recorded single-GPU verification (2026-11-27, Google Colab Linux):**
 
