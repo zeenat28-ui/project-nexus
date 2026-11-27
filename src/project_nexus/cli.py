@@ -6,8 +6,10 @@ import argparse
 import asyncio
 import contextlib
 import json
+import ssl
 import sys
 from collections.abc import Iterator, Sequence
+from pathlib import Path
 from typing import Any
 
 import uvicorn
@@ -28,7 +30,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    serve_parser = subparsers.add_parser("serve", help="Run the Nexus HTTP serving gateway.")
+    serve_parser = subparsers.add_parser("serve", help="Run the Nexus HTTP/HTTPS serving gateway.")
     serve_parser.add_argument("--config", help="Path to YAML or TOML configuration file.")
     serve_parser.add_argument("--host", help="Override server bind host.")
     serve_parser.add_argument("--port", type=int, help="Override server bind port.")
@@ -157,7 +159,50 @@ class _NoSignalServer(uvicorn.Server):
         yield
 
 
+def build_uvicorn_tls_kwargs(
+    *,
+    cert_path: str | None,
+    key_path: str | None,
+    ca_bundle_path: str | None = None,
+    require_client_cert: bool = False,
+) -> dict[str, Any]:
+    """Validate TLS file paths and return Uvicorn SSL configuration kwargs."""
+    if not cert_path or not key_path:
+        return {}
+    for label, raw_path in (
+        ("TLS certificate", cert_path),
+        ("TLS private key", key_path),
+    ):
+        if not Path(raw_path).is_file():
+            raise ConfigError(f"{label} file not found: {raw_path}")
+
+    kwargs: dict[str, Any] = {
+        "ssl_certfile": cert_path,
+        "ssl_keyfile": key_path,
+        "ssl_version": ssl.PROTOCOL_TLS_SERVER,
+    }
+    if ca_bundle_path:
+        if not Path(ca_bundle_path).is_file():
+            raise ConfigError(f"TLS CA bundle file not found: {ca_bundle_path}")
+        kwargs["ssl_ca_certs"] = ca_bundle_path
+        kwargs["ssl_cert_reqs"] = (
+            int(ssl.CERT_REQUIRED) if require_client_cert else int(ssl.CERT_OPTIONAL)
+        )
+    return kwargs
+
+
 async def _serve_async(settings: NexusSettings) -> None:
+    main_tls = build_uvicorn_tls_kwargs(
+        cert_path=settings.server.tls_cert_path,
+        key_path=settings.server.tls_key_path,
+        ca_bundle_path=settings.server.tls_ca_bundle_path,
+        require_client_cert=settings.server.tls_require_client_cert,
+    )
+    metrics_tls = build_uvicorn_tls_kwargs(
+        cert_path=settings.metrics.tls_cert_path,
+        key_path=settings.metrics.tls_key_path,
+    )
+
     metrics = NexusMetrics()
     gateway_app = create_app(settings, metrics=metrics)
 
@@ -169,6 +214,7 @@ async def _serve_async(settings: NexusSettings) -> None:
             access_log=False,
             log_level=settings.logging.level.lower(),
             timeout_graceful_shutdown=int(settings.server.shutdown_drain_seconds) + 5,
+            **main_tls,
         )
     )
 
@@ -181,7 +227,12 @@ async def _serve_async(settings: NexusSettings) -> None:
         if settings.metrics.bearer_token is not None
         else None
     )
-    metrics_app = create_metrics_app(metrics, bearer_token=metrics_secret)
+    metrics_app = create_metrics_app(
+        metrics,
+        bearer_token=metrics_secret,
+        usage_meter=gateway_app.state.usage_meter,
+        router=gateway_app.state.router,
+    )
     metrics_server = _NoSignalServer(
         uvicorn.Config(
             metrics_app,
@@ -189,6 +240,7 @@ async def _serve_async(settings: NexusSettings) -> None:
             port=settings.metrics.port,
             access_log=False,
             log_level="warning",
+            **metrics_tls,
         )
     )
 
@@ -324,6 +376,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "serve":
         try:
             asyncio.run(_serve_async(settings))
+        except ConfigError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 2
         except KeyboardInterrupt:
             return 0
         return 0

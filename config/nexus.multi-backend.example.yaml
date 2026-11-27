@@ -1,11 +1,11 @@
-# Example multi-backend routing configuration pairing separate NVIDIA CUDA and
-# AMD ROCm OpenAI-compatible inference servers behind a single Nexus gateway.
+# Example heterogeneous multi-backend configuration combining separate NVIDIA CUDA
+# and AMD ROCm vLLM pools with cost-aware scheduling, KV-cache spillover, built-in
+# TLS options, and multi-tenant token/cost metering.
 #
-# Each backend pool runs its own isolated upstream GPU runtime and has its own
-# independent circuit breaker. Project Nexus never mixes NVIDIA and AMD GPUs
-# inside a single inference process.
+# Each pool runs its own vendor-specific upstream inference server with an
+# independent circuit breaker and optional upstream Prometheus KV-cache scraping.
 #
-# Supply credentials via environment variables (do not commit secrets here):
+# Supply secrets via environment variables (do not commit real tokens here):
 #   NEXUS_AUTH_API_KEY
 #   NEXUS_METRICS_BEARER_TOKEN
 #   NEXUS_LIMITS_RATE_LIMIT_REDIS_URL  (if using rate_limit_backend: redis)
@@ -14,39 +14,72 @@ server:
   host: "127.0.0.1"
   port: 8000
   shutdown_drain_seconds: 15.0
+  # Enable built-in HTTPS (and optional inbound mTLS) by providing cert/key paths:
+  # tls_cert_path: "/etc/nexus/tls/server.crt"
+  # tls_key_path: "/etc/nexus/tls/server.key"
+  # tls_ca_bundle_path: "/etc/nexus/tls/client-ca.crt"
+  # tls_require_client_cert: false
 
 backends:
+  rocm-pool:
+    type: "openai_compatible"
+    base_url: "http://vllm-rocm.inference.svc.cluster.local:8000"
+    model: "Qwen/Qwen2.5-7B-Instruct"
+    api_style: "chat_completions"
+    health_path: "/health"
+    metrics_path: "/metrics"
+    max_kv_cache_usage_ratio: 0.90
+    accelerator: "amd_rocm"
+    gpu_count: 4
+    weight: 2
+    cost_tier: 1
+    connect_timeout_seconds: 5.0
+    read_timeout_seconds: 30.0
+    verify_tls: true
+
   cuda-pool:
     type: "openai_compatible"
     base_url: "http://vllm-cuda.inference.svc.cluster.local:8000"
     model: "Qwen/Qwen2.5-7B-Instruct"
     api_style: "chat_completions"
     health_path: "/health"
-    connect_timeout_seconds: 5.0
-    read_timeout_seconds: 30.0
-    verify_tls: true
-
-  rocm-pool:
-    type: "openai_compatible"
-    base_url: "http://vllm-rocm.inference.svc.cluster.local:8000"
-    model: "meta-llama/Llama-3.1-8B-Instruct"
-    api_style: "chat_completions"
-    health_path: "/health"
+    metrics_path: "/metrics"
+    max_kv_cache_usage_ratio: 0.90
+    accelerator: "nvidia_cuda"
+    gpu_count: 4
+    weight: 3
+    cost_tier: 2
     connect_timeout_seconds: 5.0
     read_timeout_seconds: 30.0
     verify_tls: true
 
 routing:
-  default_backend: "cuda-pool"
+  default_backend: "rocm-pool"
+  # Route one shared model across both ROCm and CUDA pools:
+  # cost_aware picks lower cost_tier (rocm-pool) first and automatically spills
+  # over to cuda-pool if rocm-pool's KV-cache exceeds 90% or its circuit opens.
+  strategy: "cost_aware"   # priority | weighted | least_inflight | latency_ewma | cost_aware
   model_routes:
-    "Qwen/Qwen2.5-7B-Instruct": "cuda-pool"
-    "meta-llama/Llama-3.1-8B-Instruct": "rocm-pool"
-  # Opt-in failover when the target pool's circuit is OPEN or hits a retryable fault.
-  # Leave false unless all pools in fallback_order serve compatible models/behavior.
-  enable_failover: false
+    "Qwen/Qwen2.5-7B-Instruct":
+      - "rocm-pool"
+      - "cuda-pool"
+  enable_failover: true
   fallback_order:
-    - "cuda-pool"
     - "rocm-pool"
+    - "cuda-pool"
+
+metering:
+  enabled: true
+  window_seconds: 86400
+  # sqlite_path: "/var/lib/nexus/usage.sqlite3"
+  default_prompt_cost_per_1k_usd: 0.0002
+  default_completion_cost_per_1k_usd: 0.0006
+  model_pricing:
+    "Qwen/Qwen2.5-7B-Instruct":
+      prompt_cost_per_1k_usd: 0.00015
+      completion_cost_per_1k_usd: 0.00045
+  default_max_tokens_per_window: 5000000
+  default_max_cost_usd_per_window: 25.0
 
 limits:
   max_request_bytes: 65536

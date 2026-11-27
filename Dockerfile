@@ -18,7 +18,7 @@ FROM python:3.12-slim-bookworm AS runtime
 
 LABEL org.opencontainers.image.title="project-nexus" \
       org.opencontainers.image.description="LLM serving integration and operations gateway" \
-      org.opencontainers.image.version="0.2.0" \
+      org.opencontainers.image.version="0.3.0" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/zeenat28-ui/project-nexus"
 

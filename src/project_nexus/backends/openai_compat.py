@@ -27,6 +27,7 @@ from project_nexus.backends.base import (
     InferenceBackend,
     TokenUsage,
 )
+from project_nexus.telemetry import EngineTelemetrySnapshot, parse_engine_prometheus_metrics
 from project_nexus.tracing import NexusTracer
 
 ApiStyle = Literal["chat_completions", "completions"]
@@ -42,6 +43,7 @@ class OpenAICompatibleBackend(InferenceBackend):
         default_model: str,
         api_style: ApiStyle = "chat_completions",
         health_path: str = "/health",
+        metrics_path: str | None = None,
         api_key: str | None = None,
         connect_timeout_seconds: float = 5.0,
         read_timeout_seconds: float = 30.0,
@@ -58,6 +60,11 @@ class OpenAICompatibleBackend(InferenceBackend):
         self._default_model = default_model
         self._api_style: ApiStyle = api_style
         self._health_path = health_path if health_path.startswith("/") else f"/{health_path}"
+        self._metrics_path = (
+            (metrics_path if metrics_path.startswith("/") else f"/{metrics_path}")
+            if metrics_path
+            else None
+        )
         self._api_key = api_key
         self._connect_timeout = connect_timeout_seconds
         self._read_timeout = read_timeout_seconds
@@ -472,6 +479,38 @@ class OpenAICompatibleBackend(InferenceBackend):
             detail=f"Upstream health endpoint returned HTTP {response.status_code}.",
             latency_ms=elapsed_ms,
         )
+
+    async def scrape_telemetry(self, *, timeout: float) -> EngineTelemetrySnapshot | None:
+        """Scrape upstream Prometheus metrics (e.g., vLLM ``/metrics``) if configured."""
+        if not self._metrics_path:
+            return None
+        client = self._ensure_client()
+        headers = {"Accept": "text/plain"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        probe_timeout = httpx.Timeout(
+            connect=min(self._connect_timeout, timeout),
+            read=timeout,
+            write=min(self._connect_timeout, timeout),
+            pool=min(self._connect_timeout, timeout),
+        )
+        try:
+            response = await client.get(
+                self._metrics_path,
+                headers=headers,
+                timeout=probe_timeout,
+            )
+        except httpx.HTTPError as exc:
+            return EngineTelemetrySnapshot(
+                scraped_at=time.time(),
+                error=f"Telemetry scrape failed ({type(exc).__name__}).",
+            )
+        if not (200 <= response.status_code < 300):
+            return EngineTelemetrySnapshot(
+                scraped_at=time.time(),
+                error=f"Telemetry endpoint returned HTTP {response.status_code}.",
+            )
+        return parse_engine_prometheus_metrics(response.text)
 
 
 def _opt_int(value: Any) -> int | None:

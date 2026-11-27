@@ -1,8 +1,8 @@
-"""Authentication and caller identification for Project Nexus.
+"""Authentication and tenant/caller identification for Project Nexus.
 
 Supports:
 - ``none``: unauthenticated (for local development or when enforced externally by an edge proxy)
-- ``api_key``: constant-time validation against one or more rotatable bearer tokens
+- ``api_key``: constant-time validation against rotatable or tenant-named bearer tokens
 - ``jwt``: asymmetric RS256/ES256 JWT validation via JWKS URL or static PEM public key
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +19,8 @@ import jwt
 from jwt import InvalidTokenError, PyJWKClient
 
 from project_nexus.config import AuthSettings
+
+_TENANT_SAFE_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 class AuthenticationError(Exception):
@@ -30,10 +33,11 @@ class AuthenticationError(Exception):
 
 @dataclass(frozen=True)
 class AuthenticatedCaller:
-    """Safe, non-secret identity of the caller for rate limiting and audit metadata."""
+    """Safe, non-secret identity of the caller for rate limiting and tenant metering."""
 
     caller_id: str
     auth_scheme: str
+    tenant_id: str = "anonymous"
 
 
 def extract_bearer_token(authorization_header: str | None) -> str | None:
@@ -59,6 +63,13 @@ def _hash_identifier(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def _sanitize_tenant_label(raw: str) -> str:
+    trimmed = raw.strip()
+    if _TENANT_SAFE_RE.fullmatch(trimmed):
+        return trimmed
+    return f"t-{_hash_identifier(trimmed)}"
+
+
 class GatewayAuthenticator:
     """Validates caller credentials according to configured ``AuthSettings``."""
 
@@ -70,9 +81,16 @@ class GatewayAuthenticator:
     ) -> None:
         self._settings = settings
         self._mode = settings.resolved_mode()
-        self._api_keys: tuple[str, ...] = tuple(
-            secret.get_secret_value() for secret in settings.all_api_keys()
-        )
+
+        key_entries: list[tuple[str | None, str]] = []
+        for tenant_name, secret in settings.named_api_keys.items():
+            key_entries.append((tenant_name, secret.get_secret_value()))
+        if settings.api_key is not None:
+            key_entries.append((None, settings.api_key.get_secret_value()))
+        for secret in settings.api_keys:
+            key_entries.append((None, secret.get_secret_value()))
+        self._api_key_entries: tuple[tuple[str | None, str], ...] = tuple(key_entries)
+
         self._jwks_client: PyJWKClient | None = None
         self._jwks_key_resolver = jwks_key_resolver
         self._static_public_key: str | None = None
@@ -109,6 +127,7 @@ class GatewayAuthenticator:
             return AuthenticatedCaller(
                 caller_id=f"ip:{_hash_identifier(host_id)}",
                 auth_scheme="none",
+                tenant_id="anonymous",
             )
 
         token = extract_bearer_token(authorization_header)
@@ -125,19 +144,26 @@ class GatewayAuthenticator:
 
     def _authenticate_api_key(self, token: str) -> AuthenticatedCaller:
         token_bytes = token.encode("utf-8")
-        matched_index: int | None = None
+        matched: tuple[str | None, str] | None = None
         # Compare against every configured key without short-circuiting to reduce timing leaks.
-        for idx, candidate in enumerate(self._api_keys):
-            if (
-                hmac.compare_digest(token_bytes, candidate.encode("utf-8"))
-                and matched_index is None
-            ):
-                matched_index = idx
-        if matched_index is None:
+        for tenant_name, candidate in self._api_key_entries:
+            if hmac.compare_digest(token_bytes, candidate.encode("utf-8")) and matched is None:
+                matched = (tenant_name, candidate)
+        if matched is None:
             raise AuthenticationError("Missing or invalid bearer token.")
+
+        tenant_name, secret_val = matched
+        key_hash = _hash_identifier(secret_val)
+        if tenant_name is not None:
+            return AuthenticatedCaller(
+                caller_id=f"tenant:{tenant_name}",
+                auth_scheme="api_key",
+                tenant_id=tenant_name,
+            )
         return AuthenticatedCaller(
-            caller_id=f"key:{_hash_identifier(self._api_keys[matched_index])}",
+            caller_id=f"key:{key_hash}",
             auth_scheme="api_key",
+            tenant_id=f"key-{key_hash[:10]}",
         )
 
     def _authenticate_jwt(self, token: str) -> AuthenticatedCaller:
@@ -181,7 +207,10 @@ class GatewayAuthenticator:
         if not isinstance(subject, str) or not subject.strip():
             raise AuthenticationError("JWT token missing non-empty 'sub' claim.")
 
+        tenant_claim = claims.get("tenant_id") or claims.get("org_id") or subject
+        tenant_label = _sanitize_tenant_label(str(tenant_claim))
         return AuthenticatedCaller(
             caller_id=f"jwt:{_hash_identifier(subject.strip())}",
             auth_scheme="jwt",
+            tenant_id=tenant_label,
         )

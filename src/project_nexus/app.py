@@ -1,4 +1,4 @@
-"""FastAPI serving gateway and internal metrics application for Project Nexus."""
+"""FastAPI serving gateway and internal metrics/admin application for Project Nexus."""
 
 from __future__ import annotations
 
@@ -40,6 +40,12 @@ from project_nexus.backends import (
 )
 from project_nexus.config import NexusSettings
 from project_nexus.logging_config import configure_logging, sanitize_request_id
+from project_nexus.metering import (
+    ModelPricing,
+    TenantBudget,
+    UsageMeter,
+    estimate_tokens_from_text,
+)
 from project_nexus.metrics import NexusMetrics, normalize_endpoint_label
 from project_nexus.rate_limit import (
     ConcurrencyLimiter,
@@ -171,6 +177,8 @@ def _infer_outcome_from_status(status_code: int) -> str:
         return "success"
     if status_code in {401, 403}:
         return "auth_error"
+    if status_code == 402:
+        return "quota_exceeded"
     if status_code == 404:
         return "not_found"
     if status_code == 405:
@@ -480,23 +488,31 @@ class RequestContextMiddleware:
             self.drain_controller.leave_request()
 
 
+def _check_admin_bearer(request: Request, bearer_token: str | None) -> JSONResponse | None:
+    if bearer_token is None:
+        return None
+    auth_header = request.headers.get("authorization")
+    if not constant_time_bearer_matches(auth_header, bearer_token):
+        request.state.outcome = "auth_error"
+        request_id = getattr(request.state, "request_id", sanitize_request_id(None))
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content=_error_payload(
+                "unauthorized",
+                "Missing or invalid bearer token for internal admin/metrics endpoint.",
+                request_id,
+            ),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return None
+
+
 def _metrics_response(
     request: Request, metrics: NexusMetrics, bearer_token: str | None
 ) -> Response:
-    if bearer_token is not None:
-        auth_header = request.headers.get("authorization")
-        if not constant_time_bearer_matches(auth_header, bearer_token):
-            request.state.outcome = "auth_error"
-            request_id = getattr(request.state, "request_id", sanitize_request_id(None))
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                content=_error_payload(
-                    "unauthorized",
-                    "Missing or invalid bearer token for metrics endpoint.",
-                    request_id,
-                ),
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    denied = _check_admin_bearer(request, bearer_token)
+    if denied is not None:
+        return denied
 
     payload, content_type = metrics.render_prometheus()
     request.state.outcome = "success"
@@ -507,10 +523,12 @@ def create_metrics_app(
     metrics: NexusMetrics,
     *,
     bearer_token: str | None = None,
+    usage_meter: UsageMeter | None = None,
+    router: BackendRouter | None = None,
 ) -> FastAPI:
-    """Create a dedicated internal ASGI app exposing only Prometheus ``/metrics``."""
+    """Create the internal app exposing ``/metrics``, ``/admin/usage``, and ``/admin/fleet``."""
     metrics_app = FastAPI(
-        title="Project Nexus Metrics",
+        title="Project Nexus Internal Metrics & Admin",
         version=__version__,
         docs_url=None,
         redoc_url=None,
@@ -520,6 +538,24 @@ def create_metrics_app(
     @metrics_app.get("/metrics")
     async def scrape_metrics(request: Request) -> Response:
         return _metrics_response(request, metrics, bearer_token)
+
+    @metrics_app.get("/admin/usage")
+    async def admin_usage(request: Request) -> Response:
+        denied = _check_admin_bearer(request, bearer_token)
+        if denied is not None:
+            return denied
+        if usage_meter is None:
+            return JSONResponse(status_code=status.HTTP_200_OK, content={"tenants": {}})
+        return JSONResponse(status_code=status.HTTP_200_OK, content=usage_meter.get_all_summaries())
+
+    @metrics_app.get("/admin/fleet")
+    async def admin_fleet(request: Request) -> Response:
+        denied = _check_admin_bearer(request, bearer_token)
+        if denied is not None:
+            return denied
+        if router is None:
+            return JSONResponse(status_code=status.HTTP_200_OK, content={"pools": {}})
+        return JSONResponse(status_code=status.HTTP_200_OK, content=router.fleet_status())
 
     return metrics_app
 
@@ -663,6 +699,39 @@ def _build_rate_limiter(settings: NexusSettings) -> RateLimiter:
     )
 
 
+def _build_usage_meter(settings: NexusSettings) -> UsageMeter:
+    m = settings.metering
+    model_pricing = {
+        model_id: ModelPricing(
+            prompt_cost_per_1k_usd=p.prompt_cost_per_1k_usd,
+            completion_cost_per_1k_usd=p.completion_cost_per_1k_usd,
+        )
+        for model_id, p in m.model_pricing.items()
+    }
+    tenant_budgets = {
+        tid: TenantBudget(
+            max_tokens_per_window=q.max_tokens_per_window,
+            max_cost_usd_per_window=q.max_cost_usd_per_window,
+        )
+        for tid, q in m.tenants.items()
+    }
+    return UsageMeter(
+        enabled=m.enabled,
+        window_seconds=m.window_seconds,
+        default_pricing=ModelPricing(
+            prompt_cost_per_1k_usd=m.default_prompt_cost_per_1k_usd,
+            completion_cost_per_1k_usd=m.default_completion_cost_per_1k_usd,
+        ),
+        model_pricing=model_pricing,
+        default_budget=TenantBudget(
+            max_tokens_per_window=m.default_max_tokens_per_window,
+            max_cost_usd_per_window=m.default_max_cost_usd_per_window,
+        ),
+        tenant_budgets=tenant_budgets,
+        sqlite_path=m.sqlite_path,
+    )
+
+
 def create_app(
     settings: NexusSettings | None = None,
     *,
@@ -673,6 +742,7 @@ def create_app(
     authenticator: GatewayAuthenticator | None = None,
     rate_limiter: RateLimiter | None = None,
     concurrency_limiter: ConcurrencyLimiter | None = None,
+    usage_meter: UsageMeter | None = None,
     tracer: NexusTracer | None = None,
     drain_controller: DrainController | None = None,
     configure_loggers: bool = True,
@@ -700,12 +770,22 @@ def create_app(
             failure_threshold=active_settings.circuit_breaker.failure_threshold,
             cooldown_seconds=active_settings.circuit_breaker.cooldown_seconds,
         )
-        active_router = BackendRouter.single(backend, circuit_breaker=breaker)
+        active_router = BackendRouter.single(
+            backend,
+            circuit_breaker=breaker,
+            accelerator=active_settings.backend.accelerator,
+            gpu_count=active_settings.backend.gpu_count,
+        )
     elif circuit_breaker is not None and not active_settings.backends:
         from project_nexus.backends import create_backend
 
         single_backend = create_backend(active_settings.backend, tracer=active_tracer)
-        active_router = BackendRouter.single(single_backend, circuit_breaker=circuit_breaker)
+        active_router = BackendRouter.single(
+            single_backend,
+            circuit_breaker=circuit_breaker,
+            accelerator=active_settings.backend.accelerator,
+            gpu_count=active_settings.backend.gpu_count,
+        )
     else:
         active_router = BackendRouter.from_settings(active_settings, tracer=active_tracer)
 
@@ -718,6 +798,7 @@ def create_app(
     active_concurrency = concurrency_limiter or ConcurrencyLimiter(
         max_concurrent=active_settings.limits.max_concurrent_requests
     )
+    active_meter = usage_meter or _build_usage_meter(active_settings)
     active_drain = drain_controller or DrainController()
 
     metrics_secret = (
@@ -762,6 +843,7 @@ def create_app(
                 )
             await active_router.shutdown()
             active_rate_limiter.close()
+            active_meter.close()
             active_tracer.shutdown()
             logger.info(
                 "Project Nexus gateway stopped",
@@ -781,6 +863,7 @@ def create_app(
     app.state.authenticator = active_auth
     app.state.rate_limiter = active_rate_limiter
     app.state.concurrency_limiter = active_concurrency
+    app.state.usage_meter = active_meter
     app.state.tracer = active_tracer
     app.state.drain_controller = active_drain
 
@@ -817,6 +900,25 @@ def create_app(
         request_id: str,
         endpoint: str,
     ) -> JSONResponse | None:
+        quota = active_meter.check_quota(caller.tenant_id)
+        if not quota.allowed:
+            reason = quota.reason or "token_budget"
+            active_metrics.observe_quota_rejection(endpoint=endpoint, reason=reason)
+            request.state.outcome = "quota_exceeded"
+            return JSONResponse(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                content={
+                    "error": {
+                        "code": "quota_exceeded",
+                        "message": f"Tenant budget exceeded ({reason}).",
+                        "request_id": request_id,
+                        "tokens_used": quota.tokens_used,
+                        "cost_usd_used": quota.cost_usd_used,
+                    }
+                },
+                headers={"Retry-After": str(quota.retry_after_seconds)},
+            )
+
         decision = active_rate_limiter.check(caller.caller_id)
         if not decision.allowed:
             active_metrics.observe_rate_limit(endpoint=endpoint, reason="rate_limit")
@@ -845,6 +947,37 @@ def create_app(
             )
 
         return None
+
+    def _record_metered_usage(
+        *,
+        tenant_id: str,
+        backend_label: str,
+        model: str,
+        prompt_text: str,
+        output_text: str,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+    ) -> None:
+        resolved_prompt = (
+            prompt_tokens if prompt_tokens is not None else estimate_tokens_from_text(prompt_text)
+        )
+        resolved_completion = (
+            completion_tokens
+            if completion_tokens is not None
+            else estimate_tokens_from_text(output_text)
+        )
+        recorded = active_meter.record_usage(
+            tenant_id=tenant_id,
+            model=model,
+            prompt_tokens=resolved_prompt,
+            completion_tokens=resolved_completion,
+        )
+        active_metrics.observe_usage(
+            backend=backend_label,
+            prompt_tokens=recorded.prompt_tokens,
+            completion_tokens=recorded.completion_tokens,
+            estimated_cost_usd=recorded.estimated_cost_usd,
+        )
 
     def _build_entry_request(
         *,
@@ -884,6 +1017,7 @@ def create_app(
         candidates = active_router.resolve_candidates(requested_model)
         last_error: tuple[int, str, str, str] | None = None
         last_retry_after: int | None = None
+        prompt_source = "\n".join(m.content for m in messages) if messages else prompt
 
         for idx, entry in enumerate(candidates):
             request.state.backend_name = entry.route_name
@@ -912,6 +1046,7 @@ def create_app(
                 messages=messages,
             )
             started = time.perf_counter()
+            active_metrics.set_backend_in_flight(entry.route_name, entry.stats.enter())
             try:
                 with active_tracer.start_span(
                     "nexus.backend.generate",
@@ -958,13 +1093,25 @@ def create_app(
                     status_code=http_code,
                     content=_error_payload(err_code, err_msg, request_id),
                 )
+            finally:
+                active_metrics.set_backend_in_flight(entry.route_name, entry.stats.leave())
 
             elapsed_s = time.perf_counter() - started
+            entry.stats.record_latency(elapsed_s * 1000.0)
             new_state = entry.circuit_breaker.record_success()
             active_metrics.set_circuit_open(entry.route_name, new_state is CircuitState.OPEN)
             active_metrics.set_backend_health(entry.route_name, True)
             active_metrics.observe_backend_call(
                 backend=entry.route_name, outcome="success", duration_seconds=elapsed_s
+            )
+            _record_metered_usage(
+                tenant_id=auth_caller.tenant_id,
+                backend_label=entry.route_name,
+                model=resp.model,
+                prompt_text=prompt_source,
+                output_text=resp.output,
+                prompt_tokens=resp.usage.prompt_tokens if resp.usage else None,
+                completion_tokens=resp.usage.completion_tokens if resp.usage else None,
             )
             request.state.outcome = "success"
             return entry, resp, elapsed_s
@@ -983,6 +1130,7 @@ def create_app(
         *,
         request: Request,
         request_id: str,
+        auth_caller: AuthenticatedCaller,
         endpoint: str,
         requested_model: str | None,
         prompt: str,
@@ -995,6 +1143,7 @@ def create_app(
         candidates = active_router.resolve_candidates(requested_model)
         last_error: tuple[int, str, str, str] | None = None
         last_retry_after: int | None = None
+        prompt_source = "\n".join(m.content for m in messages) if messages else prompt
 
         selected_entry: RoutedBackendEntry | None = None
         selected_probe = False
@@ -1032,6 +1181,7 @@ def create_app(
             )
             started = time.perf_counter()
             deadline = time.monotonic() + active_settings.limits.request_timeout_seconds
+            active_metrics.set_backend_in_flight(entry.route_name, entry.stats.enter())
             stream_iter = entry.backend.generate_stream(
                 backend_req,
                 request_id=request_id,
@@ -1044,8 +1194,10 @@ def create_app(
                     timeout=max(0.01, deadline - time.monotonic()),
                 )
             except StopAsyncIteration:
+                active_metrics.set_backend_in_flight(entry.route_name, entry.stats.leave())
                 active_concurrency.release()
                 elapsed_s = time.perf_counter() - started
+                entry.stats.record_latency(elapsed_s * 1000.0)
                 new_state = entry.circuit_breaker.record_success()
                 active_metrics.set_circuit_open(entry.route_name, new_state is CircuitState.OPEN)
                 active_metrics.set_backend_health(entry.route_name, True)
@@ -1059,6 +1211,7 @@ def create_app(
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
             except asyncio.CancelledError:
+                active_metrics.set_backend_in_flight(entry.route_name, entry.stats.leave())
                 active_concurrency.release()
                 if is_half_open_probe:
                     entry.circuit_breaker.release_probe()
@@ -1069,6 +1222,7 @@ def create_app(
                 )
                 raise
             except Exception as exc:
+                active_metrics.set_backend_in_flight(entry.route_name, entry.stats.leave())
                 aclose = getattr(stream_iter, "aclose", None)
                 if callable(aclose):
                     with contextlib.suppress(Exception):
@@ -1165,6 +1319,14 @@ def create_app(
         async def event_generator() -> AsyncIterator[str]:
             completed_cleanly = False
             cancelled = False
+            collected_deltas: list[str] = []
+            last_model = first_ref.model
+            reported_prompt_tokens: int | None = (
+                first_ref.usage.prompt_tokens if first_ref.usage else None
+            )
+            reported_completion_tokens: int | None = (
+                first_ref.usage.completion_tokens if first_ref.usage else None
+            )
             try:
                 with (
                     active_metrics.track_active_stream(endpoint),
@@ -1178,6 +1340,8 @@ def create_app(
                         },
                     ) as span,
                 ):
+                    if first_ref.delta:
+                        collected_deltas.append(first_ref.delta)
                     yield format_chunk(first_ref, include_role=True)
                     while True:
                         if await request.is_disconnected():
@@ -1191,6 +1355,15 @@ def create_app(
                             chunk = await asyncio.wait_for(anext(iter_ref), timeout=remaining)
                         except StopAsyncIteration:
                             break
+                        if chunk.delta:
+                            collected_deltas.append(chunk.delta)
+                        if chunk.model:
+                            last_model = chunk.model
+                        if chunk.usage is not None:
+                            if chunk.usage.prompt_tokens is not None:
+                                reported_prompt_tokens = chunk.usage.prompt_tokens
+                            if chunk.usage.completion_tokens is not None:
+                                reported_completion_tokens = chunk.usage.completion_tokens
                         yield format_chunk(chunk, include_role=False)
 
                     yield "data: [DONE]\n\n"
@@ -1236,9 +1409,11 @@ def create_app(
                 if callable(aclose):
                     with contextlib.suppress(Exception):
                         await aclose()
+                active_metrics.set_backend_in_flight(entry_ref.route_name, entry_ref.stats.leave())
                 active_concurrency.release()
                 if completed_cleanly:
                     elapsed_s = time.perf_counter() - started
+                    entry_ref.stats.record_latency(elapsed_s * 1000.0)
                     new_state = entry_ref.circuit_breaker.record_success()
                     active_metrics.set_circuit_open(
                         entry_ref.route_name, new_state is CircuitState.OPEN
@@ -1248,6 +1423,15 @@ def create_app(
                         backend=entry_ref.route_name,
                         outcome="success",
                         duration_seconds=elapsed_s,
+                    )
+                    _record_metered_usage(
+                        tenant_id=auth_caller.tenant_id,
+                        backend_label=entry_ref.route_name,
+                        model=last_model,
+                        prompt_text=prompt_source,
+                        output_text="".join(collected_deltas),
+                        prompt_tokens=reported_prompt_tokens,
+                        completion_tokens=reported_completion_tokens,
                     )
                 elif cancelled:
                     if selected_probe:
@@ -1333,6 +1517,11 @@ def create_app(
             active_metrics.set_circuit_open(
                 route_name, info.get("circuit_state") == CircuitState.OPEN.value
             )
+            active_metrics.set_backend_telemetry(
+                route_name,
+                kv_cache_usage_ratio=info.get("kv_cache_usage_ratio"),
+                queue_depth=info.get("queue_depth"),
+            )
 
         if not active_router.is_multi_backend:
             sole = status_map[active_router.default_route]
@@ -1397,6 +1586,18 @@ def create_app(
             content={"object": "list", "data": active_router.list_models()},
         )
 
+    @app.get("/v1/usage")
+    async def caller_usage(request: Request) -> Response:
+        request_id = str(getattr(request.state, "request_id", sanitize_request_id(None)))
+        auth_result = _authenticate(request, request_id)
+        if isinstance(auth_result, JSONResponse):
+            return auth_result
+        request.state.outcome = "success"
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=active_meter.get_tenant_summary(auth_result.tenant_id),
+        )
+
     @app.post("/v1/generate", response_model=None)
     async def generate(request: Request, payload: GenerateRequest) -> Response | GenerateResponse:
         request_id = str(getattr(request.state, "request_id", sanitize_request_id(None)))
@@ -1437,6 +1638,7 @@ def create_app(
             return await _execute_streaming(
                 request=request,
                 request_id=request_id,
+                auth_caller=auth_result,
                 endpoint="/v1/generate",
                 requested_model=payload.model,
                 prompt=payload.prompt,
@@ -1553,6 +1755,7 @@ def create_app(
             return await _execute_streaming(
                 request=request,
                 request_id=request_id,
+                auth_caller=auth_result,
                 endpoint="/v1/chat/completions",
                 requested_model=payload.model,
                 prompt=payload.messages[-1].content,

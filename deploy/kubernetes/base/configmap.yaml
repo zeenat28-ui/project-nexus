@@ -8,7 +8,7 @@ metadata:
   name: nexus-gateway-config
   labels:
     app.kubernetes.io/name: nexus-gateway
-    app.kubernetes.io/version: "0.2.0"
+    app.kubernetes.io/version: "0.3.0"
 data:
   nexus.yaml: |
     server:

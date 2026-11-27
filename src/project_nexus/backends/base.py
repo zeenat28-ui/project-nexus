@@ -6,6 +6,8 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
+from project_nexus.telemetry import EngineTelemetrySnapshot
+
 
 class BackendError(Exception):
     """Base error raised by inference backend adapters."""
@@ -167,3 +169,8 @@ class InferenceBackend(ABC):
     @abstractmethod
     async def health_check(self, *, timeout: float) -> BackendHealth:
         """Probe whether the underlying inference backend is ready to serve requests."""
+
+    async def scrape_telemetry(self, *, timeout: float) -> EngineTelemetrySnapshot | None:
+        """Optionally scrape upstream GPU KV-cache and queue telemetry."""
+        del timeout
+        return None

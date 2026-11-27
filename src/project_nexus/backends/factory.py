@@ -34,6 +34,7 @@ def create_backend(
             default_model=settings.model,
             api_style=settings.api_style,
             health_path=settings.health_path,
+            metrics_path=settings.metrics_path,
             api_key=settings.api_key.get_secret_value() if settings.api_key else None,
             connect_timeout_seconds=settings.connect_timeout_seconds,
             read_timeout_seconds=settings.read_timeout_seconds,

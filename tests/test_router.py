@@ -20,9 +20,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 def test_shipped_multi_backend_example_config_validates() -> None:
     cfg = load_settings(REPO_ROOT / "config" / "nexus.multi-backend.example.yaml", env={})
     assert set(cfg.backends.keys()) == {"cuda-pool", "rocm-pool"}
-    assert cfg.routing.default_backend == "cuda-pool"
-    assert cfg.routing.model_routes["Qwen/Qwen2.5-7B-Instruct"] == "cuda-pool"
-    assert cfg.routing.model_routes["meta-llama/Llama-3.1-8B-Instruct"] == "rocm-pool"
+    assert cfg.routing.default_backend == "rocm-pool"
+    assert cfg.routing.strategy == "cost_aware"
+    assert cfg.routing.model_routes["Qwen/Qwen2.5-7B-Instruct"] == ["rocm-pool", "cuda-pool"]
+    assert cfg.backends["rocm-pool"].accelerator == "amd_rocm"
+    assert cfg.backends["cuda-pool"].accelerator == "nvidia_cuda"
+    assert cfg.metering.enabled is True
 
 
 def test_multi_backend_config_validation_errors(tmp_path: Path) -> None:

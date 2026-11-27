@@ -21,7 +21,10 @@ ALLOWED_ENDPOINTS: frozenset[str] = frozenset(
         "/v1/generate",
         "/v1/chat/completions",
         "/v1/models",
+        "/v1/usage",
         "/metrics",
+        "/admin/usage",
+        "/admin/fleet",
         "other",
     }
 )
@@ -36,6 +39,7 @@ ALLOWED_OUTCOMES: frozenset[str] = frozenset(
         "method_not_allowed",
         "rate_limited",
         "concurrency_limited",
+        "quota_exceeded",
         "draining",
         "timeout",
         "backend_unavailable",
@@ -128,6 +132,24 @@ class NexusMetrics:
             labelnames=("backend",),
             registry=self.registry,
         )
+        self.backend_in_flight = Gauge(
+            "nexus_backend_in_flight_requests",
+            "Active upstream inference requests per backend pool.",
+            labelnames=("backend",),
+            registry=self.registry,
+        )
+        self.backend_kv_cache_usage_ratio = Gauge(
+            "nexus_backend_kv_cache_usage_ratio",
+            "Latest scraped upstream GPU KV-cache utilization ratio (0.0-1.0).",
+            labelnames=("backend",),
+            registry=self.registry,
+        )
+        self.backend_queue_depth = Gauge(
+            "nexus_backend_queue_depth",
+            "Latest scraped upstream running+waiting request count.",
+            labelnames=("backend",),
+            registry=self.registry,
+        )
         self.in_flight_requests = Gauge(
             "nexus_in_flight_requests",
             "Number of HTTP requests currently being processed.",
@@ -146,11 +168,30 @@ class NexusMetrics:
             labelnames=("endpoint", "reason"),
             registry=self.registry,
         )
+        self.quota_rejected_total = Counter(
+            "nexus_quota_rejected_total",
+            "Total requests rejected by tenant token or cost budgets.",
+            labelnames=("endpoint", "reason"),
+            registry=self.registry,
+        )
+        self.tokens_total = Counter(
+            "nexus_tokens_total",
+            "Total metered tokens processed per backend pool.",
+            labelnames=("backend", "token_type"),
+            registry=self.registry,
+        )
+        self.estimated_cost_usd_total = Counter(
+            "nexus_estimated_cost_usd_total",
+            "Cumulative estimated inference cost in USD per backend pool.",
+            labelnames=("backend",),
+            registry=self.registry,
+        )
 
     def initialize_backend(self, backend_name: str) -> None:
         """Initialize backend gauges to conservative starting values."""
         self.backend_healthy.labels(backend=backend_name).set(0.0)
         self.backend_circuit_open.labels(backend=backend_name).set(0.0)
+        self.backend_in_flight.labels(backend=backend_name).set(0.0)
 
     def observe_request(
         self,
@@ -214,11 +255,50 @@ class NexusMetrics:
         safe_reason = reason if reason in {"rate_limit", "concurrency_limit"} else "rate_limit"
         self.rate_limited_total.labels(endpoint=norm_endpoint, reason=safe_reason).inc()
 
+    def observe_quota_rejection(self, *, endpoint: str, reason: str) -> None:
+        norm_endpoint = normalize_endpoint_label(endpoint)
+        safe_reason = reason if reason in {"token_budget", "cost_budget"} else "token_budget"
+        self.quota_rejected_total.labels(endpoint=norm_endpoint, reason=safe_reason).inc()
+
+    def observe_usage(
+        self,
+        *,
+        backend: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        estimated_cost_usd: float,
+    ) -> None:
+        if prompt_tokens > 0:
+            self.tokens_total.labels(backend=backend, token_type="prompt").inc(  # noqa: S106
+                prompt_tokens
+            )
+        if completion_tokens > 0:
+            self.tokens_total.labels(backend=backend, token_type="completion").inc(  # noqa: S106
+                completion_tokens
+            )
+        if estimated_cost_usd > 0.0:
+            self.estimated_cost_usd_total.labels(backend=backend).inc(estimated_cost_usd)
+
     def set_backend_health(self, backend: str, healthy: bool) -> None:
         self.backend_healthy.labels(backend=backend).set(1.0 if healthy else 0.0)
 
     def set_circuit_open(self, backend: str, is_open: bool) -> None:
         self.backend_circuit_open.labels(backend=backend).set(1.0 if is_open else 0.0)
+
+    def set_backend_in_flight(self, backend: str, count: int) -> None:
+        self.backend_in_flight.labels(backend=backend).set(max(0, count))
+
+    def set_backend_telemetry(
+        self,
+        backend: str,
+        *,
+        kv_cache_usage_ratio: float | None,
+        queue_depth: int | None,
+    ) -> None:
+        if kv_cache_usage_ratio is not None:
+            self.backend_kv_cache_usage_ratio.labels(backend=backend).set(kv_cache_usage_ratio)
+        if queue_depth is not None:
+            self.backend_queue_depth.labels(backend=backend).set(queue_depth)
 
     @contextmanager
     def track_in_flight(self, endpoint: str) -> Iterator[None]:

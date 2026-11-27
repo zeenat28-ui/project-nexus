@@ -26,6 +26,8 @@ else:  # pragma: no cover - Python 3.10 fallback
     import tomli as tomllib  # type: ignore[import-not-found,unused-ignore]
 
 AllowedJWTAlgorithm = Literal["RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "EdDSA"]
+AcceleratorType = Literal["unknown", "cpu", "nvidia_cuda", "amd_rocm"]
+RoutingStrategy = Literal["priority", "weighted", "least_inflight", "latency_ewma", "cost_aware"]
 _POOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
@@ -34,13 +36,49 @@ class ConfigError(ValueError):
 
 
 class ServerSettings(BaseModel):
-    """HTTP listener and graceful shutdown settings for the serving gateway."""
+    """HTTP/HTTPS listener, inbound mTLS, and graceful shutdown settings."""
 
     model_config = ConfigDict(extra="forbid")
 
     host: str = Field(default="127.0.0.1", min_length=1)
     port: int = Field(default=8000, ge=1, le=65535)
     shutdown_drain_seconds: float = Field(default=10.0, ge=0.0, le=300.0)
+    tls_cert_path: str | None = None
+    tls_key_path: str | None = None
+    tls_ca_bundle_path: str | None = None
+    tls_require_client_cert: bool = False
+
+    @property
+    def tls_enabled(self) -> bool:
+        return bool(self.tls_cert_path and self.tls_key_path)
+
+    @model_validator(mode="after")
+    def validate_tls(self) -> ServerSettings:
+        has_cert = self.tls_cert_path is not None
+        has_key = self.tls_key_path is not None
+        if has_cert != has_key:
+            raise ValueError(
+                "server.tls_cert_path and server.tls_key_path must both be set together "
+                "to enable built-in TLS termination"
+            )
+        if self.tls_cert_path is not None and not self.tls_cert_path.strip():
+            raise ValueError("server.tls_cert_path cannot be empty")
+        if self.tls_key_path is not None and not self.tls_key_path.strip():
+            raise ValueError("server.tls_key_path cannot be empty")
+        if self.tls_ca_bundle_path is not None and not self.tls_ca_bundle_path.strip():
+            raise ValueError("server.tls_ca_bundle_path cannot be empty")
+        if self.tls_require_client_cert:
+            if not self.tls_enabled:
+                raise ValueError(
+                    "server.tls_require_client_cert=true requires server.tls_cert_path and "
+                    "server.tls_key_path"
+                )
+            if not self.tls_ca_bundle_path:
+                raise ValueError(
+                    "server.tls_require_client_cert=true requires server.tls_ca_bundle_path "
+                    "to verify client certificates"
+                )
+        return self
 
 
 class MockBackendSettings(BaseModel):
@@ -54,7 +92,7 @@ class MockBackendSettings(BaseModel):
 
 
 class BackendSettings(BaseModel):
-    """Inference backend configuration including optional upstream mTLS."""
+    """Inference backend configuration including accelerator metadata, telemetry, and mTLS."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -63,6 +101,12 @@ class BackendSettings(BaseModel):
     base_url: str | None = None
     api_style: Literal["chat_completions", "completions"] = "chat_completions"
     health_path: str = Field(default="/health", min_length=1, max_length=256)
+    metrics_path: str | None = Field(default=None, min_length=1, max_length=256)
+    max_kv_cache_usage_ratio: float = Field(default=0.95, gt=0.0, le=1.0)
+    accelerator: AcceleratorType = "unknown"
+    gpu_count: int = Field(default=0, ge=0, le=1024)
+    weight: int = Field(default=1, ge=1, le=1000)
+    cost_tier: int = Field(default=1, ge=1, le=100)
     api_key: SecretStr | None = None
     connect_timeout_seconds: float = Field(default=5.0, gt=0.0, le=60.0)
     read_timeout_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
@@ -80,6 +124,12 @@ class BackendSettings(BaseModel):
             raise ValueError(
                 "backend.health_path must be a relative URL path starting with '/' without '..'"
             )
+        if self.metrics_path is not None and (
+            not self.metrics_path.startswith("/") or ".." in self.metrics_path
+        ):
+            raise ValueError(
+                "backend.metrics_path must be a relative URL path starting with '/' without '..'"
+            )
 
         has_cert = self.client_cert_path is not None
         has_key = self.client_key_path is not None
@@ -96,6 +146,8 @@ class BackendSettings(BaseModel):
         if self.type == "mock":
             if self.model is None:
                 self.model = "mock-llm-v1"
+            if self.accelerator == "unknown":
+                self.accelerator = "cpu"
             return self
 
         if not self.base_url:
@@ -123,12 +175,13 @@ class BackendSettings(BaseModel):
 
 
 class RoutingSettings(BaseModel):
-    """Optional multi-backend model routing and explicit failover policy."""
+    """Multi-backend heterogeneous routing, scheduling strategy, and failover policy."""
 
     model_config = ConfigDict(extra="forbid")
 
     default_backend: str | None = None
-    model_routes: dict[str, str] = Field(default_factory=dict)
+    model_routes: dict[str, str | list[str]] = Field(default_factory=dict)
+    strategy: RoutingStrategy = "priority"
     enable_failover: bool = False
     fallback_order: list[str] = Field(default_factory=list)
 
@@ -161,13 +214,14 @@ class JWTAuthSettings(BaseModel):
 
 
 class AuthSettings(BaseModel):
-    """Authentication configuration supporting rotatable API keys or asymmetric JWTs."""
+    """Authentication configuration supporting named/rotatable API keys or asymmetric JWTs."""
 
     model_config = ConfigDict(extra="forbid")
 
     mode: Literal["auto", "none", "api_key", "jwt"] = "auto"
     api_key: SecretStr | None = None
     api_keys: list[SecretStr] = Field(default_factory=list)
+    named_api_keys: dict[str, SecretStr] = Field(default_factory=dict)
     jwt: JWTAuthSettings | None = None
 
     def all_api_keys(self) -> list[SecretStr]:
@@ -175,6 +229,7 @@ class AuthSettings(BaseModel):
         if self.api_key is not None:
             keys.append(self.api_key)
         keys.extend(self.api_keys)
+        keys.extend(self.named_api_keys.values())
         return keys
 
     def resolved_mode(self) -> Literal["none", "api_key", "jwt"]:
@@ -188,14 +243,54 @@ class AuthSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_auth_mode(self) -> AuthSettings:
+        for tenant_name in self.named_api_keys:
+            if not _POOL_NAME_PATTERN.fullmatch(tenant_name):
+                raise ValueError(
+                    f"Invalid tenant name {tenant_name!r} in auth.named_api_keys; "
+                    "use 1-64 characters from A-Z, a-z, 0-9, '.', '_', '-'."
+                )
         if self.mode == "api_key" and not self.all_api_keys():
             raise ValueError(
-                "auth.mode='api_key' requires auth.api_key or auth.api_keys "
-                "(NEXUS_AUTH_API_KEY / NEXUS_AUTH_API_KEYS)"
+                "auth.mode='api_key' requires auth.api_key, auth.api_keys, or "
+                "auth.named_api_keys (NEXUS_AUTH_API_KEY / NEXUS_AUTH_API_KEYS)"
             )
         if self.mode == "jwt" and self.jwt is None:
             raise ValueError("auth.mode='jwt' requires an auth.jwt section")
         return self
+
+
+class ModelPricingSettings(BaseModel):
+    """Per-1K token pricing for a model in USD."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_cost_per_1k_usd: float = Field(default=0.0, ge=0.0)
+    completion_cost_per_1k_usd: float = Field(default=0.0, ge=0.0)
+
+
+class TenantQuotaSettings(BaseModel):
+    """Per-tenant token and USD cost caps within the metering window."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_tokens_per_window: int | None = Field(default=None, ge=1)
+    max_cost_usd_per_window: float | None = Field(default=None, gt=0.0)
+
+
+class MeteringSettings(BaseModel):
+    """Multi-tenant usage metering, cost accounting, and budget enforcement settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    window_seconds: int = Field(default=86_400, ge=60, le=2_592_000)
+    sqlite_path: str | None = None
+    default_prompt_cost_per_1k_usd: float = Field(default=0.0, ge=0.0)
+    default_completion_cost_per_1k_usd: float = Field(default=0.0, ge=0.0)
+    model_pricing: dict[str, ModelPricingSettings] = Field(default_factory=dict)
+    default_max_tokens_per_window: int | None = Field(default=None, ge=1)
+    default_max_cost_usd_per_window: float | None = Field(default=None, gt=0.0)
+    tenants: dict[str, TenantQuotaSettings] = Field(default_factory=dict)
 
 
 class LimitsSettings(BaseModel):
@@ -272,7 +367,7 @@ class TracingSettings(BaseModel):
 
 
 class MetricsSettings(BaseModel):
-    """Prometheus metrics exposure configuration (secure by default)."""
+    """Prometheus metrics & internal admin listener settings (secure by default)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -281,9 +376,15 @@ class MetricsSettings(BaseModel):
     port: int = Field(default=9090, ge=1, le=65535)
     bearer_token: SecretStr | None = None
     allow_unauthenticated_main: bool = False
+    tls_cert_path: str | None = None
+    tls_key_path: str | None = None
 
     @model_validator(mode="after")
     def validate_metrics_security(self) -> MetricsSettings:
+        if (self.tls_cert_path is None) != (self.tls_key_path is None):
+            raise ValueError(
+                "metrics.tls_cert_path and metrics.tls_key_path must both be set together"
+            )
         if (
             self.mode == "main"
             and self.bearer_token is None
@@ -308,6 +409,7 @@ class NexusSettings(BaseModel):
     backends: dict[str, BackendSettings] = Field(default_factory=dict)
     routing: RoutingSettings = Field(default_factory=RoutingSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
+    metering: MeteringSettings = Field(default_factory=MeteringSettings)
     limits: LimitsSettings = Field(default_factory=LimitsSettings)
     circuit_breaker: CircuitBreakerSettings = Field(default_factory=CircuitBreakerSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
@@ -342,12 +444,18 @@ class NexusSettings(BaseModel):
                     "under backends."
                 )
 
-            for model_id, target_pool in self.routing.model_routes.items():
-                if target_pool not in self.backends:
+            for model_id, target in self.routing.model_routes.items():
+                pool_list = [target] if isinstance(target, str) else target
+                if not pool_list:
                     raise ValueError(
-                        f"routing.model_routes[{model_id!r}] references unknown backend pool "
-                        f"{target_pool!r}."
+                        f"routing.model_routes[{model_id!r}] must specify at least one pool."
                     )
+                for target_pool in pool_list:
+                    if target_pool not in self.backends:
+                        raise ValueError(
+                            f"routing.model_routes[{model_id!r}] references unknown backend pool "
+                            f"{target_pool!r}."
+                        )
 
             for fallback_pool in self.routing.fallback_order:
                 if fallback_pool not in self.backends:
@@ -467,11 +575,17 @@ _ENV_MAPPINGS: tuple[
     ("NEXUS_SERVER_HOST", ("server", "host"), "str"),
     ("NEXUS_SERVER_PORT", ("server", "port"), "int"),
     ("NEXUS_SERVER_SHUTDOWN_DRAIN_SECONDS", ("server", "shutdown_drain_seconds"), "float"),
+    ("NEXUS_SERVER_TLS_CERT_PATH", ("server", "tls_cert_path"), "str"),
+    ("NEXUS_SERVER_TLS_KEY_PATH", ("server", "tls_key_path"), "str"),
+    ("NEXUS_SERVER_TLS_CA_BUNDLE_PATH", ("server", "tls_ca_bundle_path"), "str"),
+    ("NEXUS_SERVER_TLS_REQUIRE_CLIENT_CERT", ("server", "tls_require_client_cert"), "bool"),
     ("NEXUS_BACKEND_TYPE", ("backend", "type"), "str"),
     ("NEXUS_BACKEND_MODEL", ("backend", "model"), "str"),
     ("NEXUS_BACKEND_BASE_URL", ("backend", "base_url"), "str"),
     ("NEXUS_BACKEND_API_STYLE", ("backend", "api_style"), "str"),
     ("NEXUS_BACKEND_HEALTH_PATH", ("backend", "health_path"), "str"),
+    ("NEXUS_BACKEND_METRICS_PATH", ("backend", "metrics_path"), "str"),
+    ("NEXUS_BACKEND_ACCELERATOR", ("backend", "accelerator"), "str"),
     ("NEXUS_BACKEND_API_KEY", ("backend", "api_key"), "str"),
     ("NEXUS_BACKEND_CONNECT_TIMEOUT_SECONDS", ("backend", "connect_timeout_seconds"), "float"),
     ("NEXUS_BACKEND_READ_TIMEOUT_SECONDS", ("backend", "read_timeout_seconds"), "float"),
@@ -485,6 +599,7 @@ _ENV_MAPPINGS: tuple[
     ("NEXUS_MOCK_MODE", ("backend", "mock", "mode"), "str"),
     ("NEXUS_MOCK_RESPONSE_PREFIX", ("backend", "mock", "response_prefix"), "str"),
     ("NEXUS_ROUTING_DEFAULT_BACKEND", ("routing", "default_backend"), "str"),
+    ("NEXUS_ROUTING_STRATEGY", ("routing", "strategy"), "str"),
     ("NEXUS_ROUTING_ENABLE_FAILOVER", ("routing", "enable_failover"), "bool"),
     ("NEXUS_AUTH_MODE", ("auth", "mode"), "str"),
     ("NEXUS_AUTH_API_KEY", ("auth", "api_key"), "str"),
@@ -493,6 +608,25 @@ _ENV_MAPPINGS: tuple[
     ("NEXUS_AUTH_JWT_PUBLIC_KEY_PEM", ("auth", "jwt", "public_key_pem"), "str"),
     ("NEXUS_AUTH_JWT_ISSUER", ("auth", "jwt", "issuer"), "str"),
     ("NEXUS_AUTH_JWT_AUDIENCE", ("auth", "jwt", "audience"), "str"),
+    ("NEXUS_METERING_ENABLED", ("metering", "enabled"), "bool"),
+    ("NEXUS_METERING_WINDOW_SECONDS", ("metering", "window_seconds"), "int"),
+    ("NEXUS_METERING_SQLITE_PATH", ("metering", "sqlite_path"), "str"),
+    (
+        "NEXUS_METERING_PROMPT_COST_PER_1K_USD",
+        ("metering", "default_prompt_cost_per_1k_usd"),
+        "float",
+    ),
+    (
+        "NEXUS_METERING_COMPLETION_COST_PER_1K_USD",
+        ("metering", "default_completion_cost_per_1k_usd"),
+        "float",
+    ),
+    ("NEXUS_METERING_DEFAULT_MAX_TOKENS", ("metering", "default_max_tokens_per_window"), "int"),
+    (
+        "NEXUS_METERING_DEFAULT_MAX_COST_USD",
+        ("metering", "default_max_cost_usd_per_window"),
+        "float",
+    ),
     ("NEXUS_LIMITS_MAX_REQUEST_BYTES", ("limits", "max_request_bytes"), "int"),
     ("NEXUS_LIMITS_MAX_PROMPT_CHARS", ("limits", "max_prompt_chars"), "int"),
     ("NEXUS_LIMITS_MAX_TOKENS_LIMIT", ("limits", "max_tokens_limit"), "int"),
@@ -521,6 +655,8 @@ _ENV_MAPPINGS: tuple[
     ("NEXUS_METRICS_PORT", ("metrics", "port"), "int"),
     ("NEXUS_METRICS_BEARER_TOKEN", ("metrics", "bearer_token"), "str"),
     ("NEXUS_METRICS_ALLOW_UNAUTHENTICATED_MAIN", ("metrics", "allow_unauthenticated_main"), "bool"),
+    ("NEXUS_METRICS_TLS_CERT_PATH", ("metrics", "tls_cert_path"), "str"),
+    ("NEXUS_METRICS_TLS_KEY_PATH", ("metrics", "tls_key_path"), "str"),
 )
 
 _EMPTY_TO_NONE_PATHS: frozenset[tuple[str, ...]] = frozenset(
@@ -530,8 +666,15 @@ _EMPTY_TO_NONE_PATHS: frozenset[tuple[str, ...]] = frozenset(
         ("backend", "ca_bundle_path"),
         ("backend", "client_cert_path"),
         ("backend", "client_key_path"),
+        ("backend", "metrics_path"),
         ("limits", "rate_limit_redis_url"),
+        ("metering", "sqlite_path"),
         ("metrics", "bearer_token"),
+        ("metrics", "tls_cert_path"),
+        ("metrics", "tls_key_path"),
+        ("server", "tls_cert_path"),
+        ("server", "tls_key_path"),
+        ("server", "tls_ca_bundle_path"),
         ("tracing", "otlp_endpoint"),
     }
 )
