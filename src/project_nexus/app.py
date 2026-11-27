@@ -28,20 +28,27 @@ from project_nexus.backends import (
     BackendClientError,
     BackendError,
     BackendGenerateRequest,
+    BackendGenerateResponse,
     BackendResponseError,
+    BackendRouter,
     BackendStreamChunk,
     BackendTimeoutError,
     BackendUnavailableError,
     ChatMessage,
     InferenceBackend,
-    create_backend,
+    RoutedBackendEntry,
 )
 from project_nexus.config import NexusSettings
 from project_nexus.logging_config import configure_logging, sanitize_request_id
 from project_nexus.metrics import NexusMetrics, normalize_endpoint_label
-from project_nexus.rate_limit import ConcurrencyLimiter, TokenBucketRateLimiter
+from project_nexus.rate_limit import (
+    ConcurrencyLimiter,
+    RateLimiter,
+    RedisRateLimiter,
+    TokenBucketRateLimiter,
+)
 from project_nexus.resilience import CircuitBreaker, CircuitState
-from project_nexus.tracing import NexusTracer
+from project_nexus.tracing import NexusTracer, configure_tracer
 
 logger = logging.getLogger("project_nexus.gateway")
 
@@ -338,13 +345,13 @@ class RequestContextMiddleware:
         app: ASGIApp,
         *,
         metrics: NexusMetrics,
-        backend_name: str,
+        default_backend_name: str,
         tracer: NexusTracer,
         drain_controller: DrainController,
     ) -> None:
         self.app = app
         self.metrics = metrics
-        self.backend_name = backend_name
+        self.default_backend_name = default_backend_name
         self.tracer = tracer
         self.drain_controller = drain_controller
 
@@ -358,6 +365,7 @@ class RequestContextMiddleware:
         state = scope.setdefault("state", {})
         state["request_id"] = request_id
         state["outcome"] = None
+        state["backend_name"] = self.default_backend_name
 
         path = str(scope.get("path", "/"))
         method = str(scope.get("method", "GET"))
@@ -383,7 +391,7 @@ class RequestContextMiddleware:
                     "nexus.http.request",
                     attributes={
                         "nexus.request_id": request_id,
-                        "nexus.backend": self.backend_name,
+                        "nexus.backend": self.default_backend_name,
                         "http.request.method": method,
                         "url.path": normalize_endpoint_label(path),
                     },
@@ -393,11 +401,13 @@ class RequestContextMiddleware:
                 try:
                     await self.app(scope, receive, send_with_request_id)
                 except asyncio.CancelledError:
+                    backend_label = str(state.get("backend_name") or self.default_backend_name)
                     duration_s = time.perf_counter() - started
+                    span.set_attribute("nexus.backend", backend_label)
                     span.set_attribute("nexus.outcome", "cancelled")
                     self.metrics.observe_cancelled_request(
                         endpoint=path,
-                        backend=self.backend_name,
+                        backend=backend_label,
                         duration_seconds=duration_s,
                     )
                     logger.warning(
@@ -407,18 +417,20 @@ class RequestContextMiddleware:
                             "method": method,
                             "path": path,
                             "latency_ms": round(duration_s * 1000.0, 2),
-                            "backend": self.backend_name,
+                            "backend": backend_label,
                             "outcome": "cancelled",
                         },
                     )
                     raise
                 except Exception as exc:
+                    backend_label = str(state.get("backend_name") or self.default_backend_name)
                     duration_s = time.perf_counter() - started
+                    span.set_attribute("nexus.backend", backend_label)
                     span.set_attribute("http.response.status_code", 500)
                     span.set_attribute("nexus.outcome", "internal_error")
                     self.metrics.observe_request(
                         endpoint=path,
-                        backend=self.backend_name,
+                        backend=backend_label,
                         status_code=500,
                         outcome="internal_error",
                         duration_seconds=duration_s,
@@ -431,20 +443,22 @@ class RequestContextMiddleware:
                             "path": path,
                             "status_code": 500,
                             "latency_ms": round(duration_s * 1000.0, 2),
-                            "backend": self.backend_name,
+                            "backend": backend_label,
                             "outcome": "internal_error",
                             "error_type": type(exc).__name__,
                         },
                     )
                     raise
 
+                backend_label = str(state.get("backend_name") or self.default_backend_name)
                 duration_s = time.perf_counter() - started
                 outcome = state.get("outcome") or _infer_outcome_from_status(status_code)
+                span.set_attribute("nexus.backend", backend_label)
                 span.set_attribute("http.response.status_code", status_code)
                 span.set_attribute("nexus.outcome", str(outcome))
                 self.metrics.observe_request(
                     endpoint=path,
-                    backend=self.backend_name,
+                    backend=backend_label,
                     status_code=status_code,
                     outcome=str(outcome),
                     duration_seconds=duration_s,
@@ -458,7 +472,7 @@ class RequestContextMiddleware:
                         "path": path,
                         "status_code": status_code,
                         "latency_ms": round(duration_s * 1000.0, 2),
-                        "backend": self.backend_name,
+                        "backend": backend_label,
                         "outcome": str(outcome),
                     },
                 )
@@ -531,26 +545,35 @@ def _usage_to_dict(usage: TokenUsageResponse | None) -> dict[str, int | None] | 
     }
 
 
-def _backend_error_response(
+def _is_retryable_failover_error(exc: Exception) -> bool:
+    if isinstance(exc, (asyncio.TimeoutError, BackendTimeoutError, BackendUnavailableError)):
+        return True
+    if isinstance(exc, BackendClientError):
+        return False
+    return isinstance(exc, BackendError) and exc.retryable
+
+
+def _record_backend_failure(
     exc: Exception,
     *,
-    request: Request,
     request_id: str,
-    backend_name: str,
+    entry: RoutedBackendEntry,
     started: float,
     is_half_open_probe: bool,
-    breaker: CircuitBreaker,
     metrics: NexusMetrics,
-) -> JSONResponse:
+) -> tuple[int, str, str, str]:
+    """Update circuit breaker and metrics for a failed backend call and return HTTP mapping."""
     elapsed_s = time.perf_counter() - started
+    backend_label = entry.route_name
+    breaker = entry.circuit_breaker
+
     if isinstance(exc, (asyncio.TimeoutError, BackendTimeoutError)):
         new_state = breaker.record_failure()
-        metrics.set_circuit_open(backend_name, new_state is CircuitState.OPEN)
-        metrics.set_backend_health(backend_name, False)
+        metrics.set_circuit_open(backend_label, new_state is CircuitState.OPEN)
+        metrics.set_backend_health(backend_label, False)
         metrics.observe_backend_call(
-            backend=backend_name, outcome="timeout", duration_seconds=elapsed_s
+            backend=backend_label, outcome="timeout", duration_seconds=elapsed_s
         )
-        request.state.outcome = "timeout"
         msg = (
             exc.message if isinstance(exc, BackendTimeoutError) else "Inference request timed out."
         )
@@ -558,79 +581,97 @@ def _backend_error_response(
             "Backend inference call timed out",
             extra={
                 "request_id": request_id,
-                "backend": backend_name,
+                "backend": backend_label,
                 "outcome": "timeout",
                 "circuit_state": new_state.value,
                 "latency_ms": round(elapsed_s * 1000.0, 2),
             },
         )
-        return JSONResponse(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            content=_error_payload("backend_timeout", msg, request_id),
-        )
+        return status.HTTP_504_GATEWAY_TIMEOUT, "backend_timeout", msg, "timeout"
 
     if isinstance(exc, BackendUnavailableError):
         new_state = breaker.record_failure()
-        metrics.set_circuit_open(backend_name, new_state is CircuitState.OPEN)
-        metrics.set_backend_health(backend_name, False)
+        metrics.set_circuit_open(backend_label, new_state is CircuitState.OPEN)
+        metrics.set_backend_health(backend_label, False)
         metrics.observe_backend_call(
-            backend=backend_name, outcome="backend_unavailable", duration_seconds=elapsed_s
+            backend=backend_label, outcome="backend_unavailable", duration_seconds=elapsed_s
         )
-        request.state.outcome = "backend_unavailable"
         logger.warning(
             "Backend unavailable during inference",
             extra={
                 "request_id": request_id,
-                "backend": backend_name,
+                "backend": backend_label,
                 "outcome": "backend_unavailable",
                 "circuit_state": new_state.value,
                 "latency_ms": round(elapsed_s * 1000.0, 2),
             },
         )
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content=_error_payload("backend_unavailable", exc.message, request_id),
+        return (
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "backend_unavailable",
+            exc.message,
+            "backend_unavailable",
         )
 
     if isinstance(exc, BackendClientError):
         if is_half_open_probe:
             breaker.release_probe()
         metrics.observe_backend_call(
-            backend=backend_name, outcome="validation_error", duration_seconds=elapsed_s
+            backend=backend_label, outcome="validation_error", duration_seconds=elapsed_s
         )
-        request.state.outcome = "validation_error"
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content=_error_payload("upstream_request_rejected", exc.message, request_id),
+        return (
+            status.HTTP_400_BAD_REQUEST,
+            "upstream_request_rejected",
+            exc.message,
+            "validation_error",
         )
 
     if isinstance(exc, (BackendResponseError, BackendError)):
         if exc.retryable:
             new_state = breaker.record_failure()
-            metrics.set_circuit_open(backend_name, new_state is CircuitState.OPEN)
-            metrics.set_backend_health(backend_name, False)
+            metrics.set_circuit_open(backend_label, new_state is CircuitState.OPEN)
+            metrics.set_backend_health(backend_label, False)
         elif is_half_open_probe:
             breaker.release_probe()
         metrics.observe_backend_call(
-            backend=backend_name, outcome="backend_error", duration_seconds=elapsed_s
+            backend=backend_label, outcome="backend_error", duration_seconds=elapsed_s
         )
-        request.state.outcome = "backend_error"
-        return JSONResponse(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            content=_error_payload("backend_error", exc.message, request_id),
-        )
+        return status.HTTP_502_BAD_GATEWAY, "backend_error", exc.message, "backend_error"
 
     raise exc
+
+
+def _build_rate_limiter(settings: NexusSettings) -> RateLimiter:
+    limits = settings.limits
+    if limits.rate_limit_backend == "redis" and limits.rate_limit_requests_per_minute > 0:
+        redis_url = (
+            limits.rate_limit_redis_url.get_secret_value()
+            if limits.rate_limit_redis_url is not None
+            else None
+        )
+        return RedisRateLimiter(
+            redis_url=redis_url,
+            requests_per_minute=limits.rate_limit_requests_per_minute,
+            burst=limits.rate_limit_burst,
+            fail_open=limits.rate_limit_redis_fail_open,
+            socket_timeout_seconds=limits.rate_limit_redis_timeout_seconds,
+        )
+    return TokenBucketRateLimiter(
+        requests_per_minute=limits.rate_limit_requests_per_minute,
+        burst=limits.rate_limit_burst,
+        max_tracked_callers=limits.max_tracked_callers,
+    )
 
 
 def create_app(
     settings: NexusSettings | None = None,
     *,
     backend: InferenceBackend | None = None,
+    router: BackendRouter | None = None,
     metrics: NexusMetrics | None = None,
     circuit_breaker: CircuitBreaker | None = None,
     authenticator: GatewayAuthenticator | None = None,
-    rate_limiter: TokenBucketRateLimiter | None = None,
+    rate_limiter: RateLimiter | None = None,
     concurrency_limiter: ConcurrencyLimiter | None = None,
     tracer: NexusTracer | None = None,
     drain_controller: DrainController | None = None,
@@ -644,23 +685,36 @@ def create_app(
             log_format=active_settings.logging.format,
         )
 
-    active_tracer = tracer or NexusTracer(
+    active_tracer = tracer or configure_tracer(
         enabled=active_settings.tracing.enabled,
         service_name=active_settings.tracing.service_name,
+        otlp_endpoint=active_settings.tracing.otlp_endpoint,
+        sample_ratio=active_settings.tracing.sample_ratio,
+        otlp_timeout_seconds=active_settings.tracing.otlp_timeout_seconds,
     )
-    active_backend = backend or create_backend(active_settings.backend, tracer=active_tracer)
+
+    if router is not None:
+        active_router = router
+    elif backend is not None:
+        breaker = circuit_breaker or CircuitBreaker(
+            failure_threshold=active_settings.circuit_breaker.failure_threshold,
+            cooldown_seconds=active_settings.circuit_breaker.cooldown_seconds,
+        )
+        active_router = BackendRouter.single(backend, circuit_breaker=breaker)
+    elif circuit_breaker is not None and not active_settings.backends:
+        from project_nexus.backends import create_backend
+
+        single_backend = create_backend(active_settings.backend, tracer=active_tracer)
+        active_router = BackendRouter.single(single_backend, circuit_breaker=circuit_breaker)
+    else:
+        active_router = BackendRouter.from_settings(active_settings, tracer=active_tracer)
+
     active_metrics = metrics or NexusMetrics()
-    active_metrics.initialize_backend(active_backend.name)
-    active_breaker = circuit_breaker or CircuitBreaker(
-        failure_threshold=active_settings.circuit_breaker.failure_threshold,
-        cooldown_seconds=active_settings.circuit_breaker.cooldown_seconds,
-    )
+    for entry in active_router.entries():
+        active_metrics.initialize_backend(entry.route_name)
+
     active_auth = authenticator or GatewayAuthenticator(active_settings.auth)
-    active_rate_limiter = rate_limiter or TokenBucketRateLimiter(
-        requests_per_minute=active_settings.limits.rate_limit_requests_per_minute,
-        burst=active_settings.limits.rate_limit_burst,
-        max_tracked_callers=active_settings.limits.max_tracked_callers,
-    )
+    active_rate_limiter = rate_limiter or _build_rate_limiter(active_settings)
     active_concurrency = concurrency_limiter or ConcurrencyLimiter(
         max_concurrent=active_settings.limits.max_concurrent_requests
     )
@@ -674,21 +728,21 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        await active_backend.startup()
+        await active_router.startup()
         if not active_auth.is_enforced:
             logger.warning(
                 "Gateway authentication is not configured; protect inference endpoints behind TLS "
                 "and auth middleware or configure NEXUS_AUTH_API_KEY / JWT before exposing beyond "
                 "localhost.",
                 extra={
-                    "backend": active_backend.name,
+                    "backend": active_router.default_route,
                     "metrics_mode": active_settings.metrics.mode,
                 },
             )
         logger.info(
             "Project Nexus gateway started",
             extra={
-                "backend": active_backend.name,
+                "backend": active_router.default_route,
                 "host": active_settings.server.host,
                 "port": active_settings.server.port,
                 "metrics_mode": active_settings.metrics.mode,
@@ -704,12 +758,14 @@ def create_app(
             if not drained:
                 logger.warning(
                     "Graceful shutdown drain timeout elapsed with requests still in flight",
-                    extra={"backend": active_backend.name},
+                    extra={"backend": active_router.default_route},
                 )
-            await active_backend.shutdown()
+            await active_router.shutdown()
+            active_rate_limiter.close()
+            active_tracer.shutdown()
             logger.info(
                 "Project Nexus gateway stopped",
-                extra={"backend": active_backend.name},
+                extra={"backend": active_router.default_route},
             )
 
     app = FastAPI(
@@ -718,9 +774,10 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.settings = active_settings
-    app.state.backend = active_backend
+    app.state.router = active_router
+    app.state.backend = active_router.default_entry.backend
+    app.state.circuit_breaker = active_router.default_entry.circuit_breaker
     app.state.metrics = active_metrics
-    app.state.circuit_breaker = active_breaker
     app.state.authenticator = active_auth
     app.state.rate_limiter = active_rate_limiter
     app.state.concurrency_limiter = active_concurrency
@@ -734,7 +791,7 @@ def create_app(
     app.add_middleware(
         RequestContextMiddleware,
         metrics=active_metrics,
-        backend_name=active_backend.name,
+        default_backend_name=active_router.default_route,
         tracer=active_tracer,
         drain_controller=active_drain,
     )
@@ -789,89 +846,275 @@ def create_app(
 
         return None
 
-    def _acquire_circuit_or_reject(
-        request: Request, request_id: str
-    ) -> tuple[bool, JSONResponse | None]:
-        allowed, is_half_open_probe = active_breaker.try_acquire()
-        if not allowed:
-            snap = active_breaker.snapshot()
-            active_metrics.set_circuit_open(active_backend.name, True)
-            active_metrics.set_backend_health(active_backend.name, False)
-            request.state.outcome = "circuit_open"
-            return False, JSONResponse(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content=_error_payload(
+    def _build_entry_request(
+        *,
+        entry: RoutedBackendEntry,
+        is_fallback: bool,
+        requested_model: str | None,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        stop: tuple[str, ...],
+        messages: tuple[ChatMessage, ...] = (),
+    ) -> BackendGenerateRequest:
+        target_model = (
+            entry.backend.default_model if (is_fallback or not requested_model) else requested_model
+        )
+        return BackendGenerateRequest(
+            prompt=prompt,
+            model=target_model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop,
+            messages=messages,
+        )
+
+    async def _execute_non_streaming(
+        *,
+        request: Request,
+        request_id: str,
+        auth_caller: AuthenticatedCaller,
+        requested_model: str | None,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        stop: tuple[str, ...],
+        messages: tuple[ChatMessage, ...] = (),
+    ) -> tuple[RoutedBackendEntry, BackendGenerateResponse, float] | JSONResponse:
+        candidates = active_router.resolve_candidates(requested_model)
+        last_error: tuple[int, str, str, str] | None = None
+        last_retry_after: int | None = None
+
+        for idx, entry in enumerate(candidates):
+            request.state.backend_name = entry.route_name
+            allowed, is_half_open_probe = entry.circuit_breaker.try_acquire()
+            if not allowed:
+                snap = entry.circuit_breaker.snapshot()
+                active_metrics.set_circuit_open(entry.route_name, True)
+                active_metrics.set_backend_health(entry.route_name, False)
+                last_retry_after = max(1, int(snap.retry_after_seconds))
+                last_error = (
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
                     "circuit_open",
                     "Backend circuit breaker is OPEN due to recent upstream failures.",
-                    request_id,
-                ),
-                headers={"Retry-After": str(max(1, int(snap.retry_after_seconds)))},
-            )
-        return is_half_open_probe, None
+                    "circuit_open",
+                )
+                continue
 
-    async def _run_streaming(
+            backend_req = _build_entry_request(
+                entry=entry,
+                is_fallback=idx > 0,
+                requested_model=requested_model,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stop=stop,
+                messages=messages,
+            )
+            started = time.perf_counter()
+            try:
+                with active_tracer.start_span(
+                    "nexus.backend.generate",
+                    attributes={
+                        "nexus.request_id": request_id,
+                        "nexus.backend": entry.route_name,
+                        "nexus.stream": False,
+                        "nexus.auth_scheme": auth_caller.auth_scheme,
+                        "nexus.failover_used": idx > 0,
+                    },
+                ):
+                    resp = await asyncio.wait_for(
+                        entry.backend.generate(
+                            backend_req,
+                            request_id=request_id,
+                            timeout=active_settings.limits.request_timeout_seconds,
+                        ),
+                        timeout=active_settings.limits.request_timeout_seconds,
+                    )
+            except asyncio.CancelledError:
+                if is_half_open_probe:
+                    entry.circuit_breaker.release_probe()
+                active_metrics.observe_backend_call(
+                    backend=entry.route_name,
+                    outcome="cancelled",
+                    duration_seconds=time.perf_counter() - started,
+                )
+                raise
+            except Exception as exc:
+                http_code, err_code, err_msg, outcome = _record_backend_failure(
+                    exc,
+                    request_id=request_id,
+                    entry=entry,
+                    started=started,
+                    is_half_open_probe=is_half_open_probe,
+                    metrics=active_metrics,
+                )
+                last_error = (http_code, err_code, err_msg, outcome)
+                last_retry_after = None
+                if _is_retryable_failover_error(exc) and idx < len(candidates) - 1:
+                    continue
+                request.state.outcome = outcome
+                return JSONResponse(
+                    status_code=http_code,
+                    content=_error_payload(err_code, err_msg, request_id),
+                )
+
+            elapsed_s = time.perf_counter() - started
+            new_state = entry.circuit_breaker.record_success()
+            active_metrics.set_circuit_open(entry.route_name, new_state is CircuitState.OPEN)
+            active_metrics.set_backend_health(entry.route_name, True)
+            active_metrics.observe_backend_call(
+                backend=entry.route_name, outcome="success", duration_seconds=elapsed_s
+            )
+            request.state.outcome = "success"
+            return entry, resp, elapsed_s
+
+        assert last_error is not None
+        http_code, err_code, err_msg, outcome = last_error
+        request.state.outcome = outcome
+        headers = {"Retry-After": str(last_retry_after)} if last_retry_after is not None else None
+        return JSONResponse(
+            status_code=http_code,
+            content=_error_payload(err_code, err_msg, request_id),
+            headers=headers,
+        )
+
+    async def _execute_streaming(
         *,
         request: Request,
         request_id: str,
         endpoint: str,
-        backend_req: BackendGenerateRequest,
-        is_half_open_probe: bool,
+        requested_model: str | None,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        stop: tuple[str, ...],
+        messages: tuple[ChatMessage, ...] = (),
         openai_format: bool,
     ) -> Response:
+        candidates = active_router.resolve_candidates(requested_model)
+        last_error: tuple[int, str, str, str] | None = None
+        last_retry_after: int | None = None
+
+        selected_entry: RoutedBackendEntry | None = None
+        selected_probe = False
+        selected_iter: AsyncIterator[BackendStreamChunk] | None = None
+        first_chunk: BackendStreamChunk | None = None
         started = time.perf_counter()
         deadline = time.monotonic() + active_settings.limits.request_timeout_seconds
-        stream_iter = active_backend.generate_stream(
-            backend_req,
-            request_id=request_id,
-            timeout=active_settings.limits.request_timeout_seconds,
-        )
+        failover_used = False
 
-        # Prefetch first chunk so immediate upstream failures return a proper HTTP error status.
-        try:
-            first_chunk = await asyncio.wait_for(
-                anext(stream_iter),
-                timeout=max(0.01, deadline - time.monotonic()),
+        for idx, entry in enumerate(candidates):
+            request.state.backend_name = entry.route_name
+            allowed, is_half_open_probe = entry.circuit_breaker.try_acquire()
+            if not allowed:
+                snap = entry.circuit_breaker.snapshot()
+                active_metrics.set_circuit_open(entry.route_name, True)
+                active_metrics.set_backend_health(entry.route_name, False)
+                last_retry_after = max(1, int(snap.retry_after_seconds))
+                last_error = (
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "circuit_open",
+                    "Backend circuit breaker is OPEN due to recent upstream failures.",
+                    "circuit_open",
+                )
+                continue
+
+            backend_req = _build_entry_request(
+                entry=entry,
+                is_fallback=idx > 0,
+                requested_model=requested_model,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stop=stop,
+                messages=messages,
             )
-        except StopAsyncIteration:
-            active_concurrency.release()
-            elapsed_s = time.perf_counter() - started
-            new_state = active_breaker.record_success()
-            active_metrics.set_circuit_open(active_backend.name, new_state is CircuitState.OPEN)
-            active_metrics.set_backend_health(active_backend.name, True)
-            active_metrics.observe_backend_call(
-                backend=active_backend.name, outcome="success", duration_seconds=elapsed_s
-            )
-            request.state.outcome = "success"
-            return StreamingResponse(
-                iter(["data: [DONE]\n\n"]),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "X-Accel-Buffering": "no",
-                },
-            )
-        except asyncio.CancelledError:
-            active_concurrency.release()
-            if is_half_open_probe:
-                active_breaker.release_probe()
-            elapsed_s = time.perf_counter() - started
-            active_metrics.observe_backend_call(
-                backend=active_backend.name, outcome="cancelled", duration_seconds=elapsed_s
-            )
-            raise
-        except Exception as exc:
-            active_concurrency.release()
-            return _backend_error_response(
-                exc,
-                request=request,
+            started = time.perf_counter()
+            deadline = time.monotonic() + active_settings.limits.request_timeout_seconds
+            stream_iter = entry.backend.generate_stream(
+                backend_req,
                 request_id=request_id,
-                backend_name=active_backend.name,
-                started=started,
-                is_half_open_probe=is_half_open_probe,
-                breaker=active_breaker,
-                metrics=active_metrics,
+                timeout=active_settings.limits.request_timeout_seconds,
             )
 
+            try:
+                first_chunk = await asyncio.wait_for(
+                    anext(stream_iter),
+                    timeout=max(0.01, deadline - time.monotonic()),
+                )
+            except StopAsyncIteration:
+                active_concurrency.release()
+                elapsed_s = time.perf_counter() - started
+                new_state = entry.circuit_breaker.record_success()
+                active_metrics.set_circuit_open(entry.route_name, new_state is CircuitState.OPEN)
+                active_metrics.set_backend_health(entry.route_name, True)
+                active_metrics.observe_backend_call(
+                    backend=entry.route_name, outcome="success", duration_seconds=elapsed_s
+                )
+                request.state.outcome = "success"
+                return StreamingResponse(
+                    iter(["data: [DONE]\n\n"]),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+            except asyncio.CancelledError:
+                active_concurrency.release()
+                if is_half_open_probe:
+                    entry.circuit_breaker.release_probe()
+                active_metrics.observe_backend_call(
+                    backend=entry.route_name,
+                    outcome="cancelled",
+                    duration_seconds=time.perf_counter() - started,
+                )
+                raise
+            except Exception as exc:
+                aclose = getattr(stream_iter, "aclose", None)
+                if callable(aclose):
+                    with contextlib.suppress(Exception):
+                        await aclose()
+                http_code, err_code, err_msg, outcome = _record_backend_failure(
+                    exc,
+                    request_id=request_id,
+                    entry=entry,
+                    started=started,
+                    is_half_open_probe=is_half_open_probe,
+                    metrics=active_metrics,
+                )
+                last_error = (http_code, err_code, err_msg, outcome)
+                last_retry_after = None
+                if _is_retryable_failover_error(exc) and idx < len(candidates) - 1:
+                    continue
+                active_concurrency.release()
+                request.state.outcome = outcome
+                return JSONResponse(
+                    status_code=http_code,
+                    content=_error_payload(err_code, err_msg, request_id),
+                )
+
+            selected_entry = entry
+            selected_probe = is_half_open_probe
+            selected_iter = stream_iter
+            failover_used = idx > 0
+            break
+
+        if selected_entry is None or selected_iter is None or first_chunk is None:
+            active_concurrency.release()
+            assert last_error is not None
+            http_code, err_code, err_msg, outcome = last_error
+            request.state.outcome = outcome
+            headers = (
+                {"Retry-After": str(last_retry_after)} if last_retry_after is not None else None
+            )
+            return JSONResponse(
+                status_code=http_code,
+                content=_error_payload(err_code, err_msg, request_id),
+                headers=headers,
+            )
+
+        entry_ref = selected_entry
+        iter_ref = selected_iter
+        first_ref = first_chunk
         created_ts = int(time.time())
         chat_id = f"chatcmpl-{request_id}"
 
@@ -903,10 +1146,11 @@ def create_app(
                     }
                 return _sse_data(payload)
 
+            backend_name = entry_ref.route_name if active_router.is_multi_backend else chunk.backend
             gen_payload: dict[str, Any] = {
                 "request_id": request_id,
                 "model": chunk.model,
-                "backend": chunk.backend,
+                "backend": backend_name,
                 "delta": chunk.delta,
                 "finish_reason": chunk.finish_reason,
             }
@@ -919,7 +1163,6 @@ def create_app(
             return _sse_data(gen_payload)
 
         async def event_generator() -> AsyncIterator[str]:
-            nonlocal stream_iter
             completed_cleanly = False
             cancelled = False
             try:
@@ -929,12 +1172,13 @@ def create_app(
                         "nexus.backend.generate_stream",
                         attributes={
                             "nexus.request_id": request_id,
-                            "nexus.backend": active_backend.name,
+                            "nexus.backend": entry_ref.route_name,
                             "nexus.stream": True,
+                            "nexus.failover_used": failover_used,
                         },
                     ) as span,
                 ):
-                    yield format_chunk(first_chunk, include_role=True)
+                    yield format_chunk(first_ref, include_role=True)
                     while True:
                         if await request.is_disconnected():
                             cancelled = True
@@ -944,7 +1188,7 @@ def create_app(
                         if remaining <= 0:
                             raise BackendTimeoutError("Streaming inference request timed out.")
                         try:
-                            chunk = await asyncio.wait_for(anext(stream_iter), timeout=remaining)
+                            chunk = await asyncio.wait_for(anext(iter_ref), timeout=remaining)
                         except StopAsyncIteration:
                             break
                         yield format_chunk(chunk, include_role=False)
@@ -956,11 +1200,13 @@ def create_app(
                 cancelled = True
                 raise
             except (asyncio.TimeoutError, BackendTimeoutError) as exc:
-                new_state = active_breaker.record_failure()
-                active_metrics.set_circuit_open(active_backend.name, new_state is CircuitState.OPEN)
-                active_metrics.set_backend_health(active_backend.name, False)
+                new_state = entry_ref.circuit_breaker.record_failure()
+                active_metrics.set_circuit_open(
+                    entry_ref.route_name, new_state is CircuitState.OPEN
+                )
+                active_metrics.set_backend_health(entry_ref.route_name, False)
                 active_metrics.observe_backend_call(
-                    backend=active_backend.name,
+                    backend=entry_ref.route_name,
                     outcome="timeout",
                     duration_seconds=time.perf_counter() - started,
                 )
@@ -972,42 +1218,42 @@ def create_app(
                 yield _sse_error("backend_timeout", msg, request_id)
             except BackendError as exc:
                 if exc.retryable:
-                    new_state = active_breaker.record_failure()
+                    new_state = entry_ref.circuit_breaker.record_failure()
                     active_metrics.set_circuit_open(
-                        active_backend.name, new_state is CircuitState.OPEN
+                        entry_ref.route_name, new_state is CircuitState.OPEN
                     )
-                    active_metrics.set_backend_health(active_backend.name, False)
-                elif is_half_open_probe:
-                    active_breaker.release_probe()
+                    active_metrics.set_backend_health(entry_ref.route_name, False)
+                elif selected_probe:
+                    entry_ref.circuit_breaker.release_probe()
                 active_metrics.observe_backend_call(
-                    backend=active_backend.name,
+                    backend=entry_ref.route_name,
                     outcome="backend_error",
                     duration_seconds=time.perf_counter() - started,
                 )
                 yield _sse_error("backend_error", exc.message, request_id)
             finally:
-                aclose = getattr(stream_iter, "aclose", None)
+                aclose = getattr(iter_ref, "aclose", None)
                 if callable(aclose):
                     with contextlib.suppress(Exception):
                         await aclose()
                 active_concurrency.release()
                 if completed_cleanly:
                     elapsed_s = time.perf_counter() - started
-                    new_state = active_breaker.record_success()
+                    new_state = entry_ref.circuit_breaker.record_success()
                     active_metrics.set_circuit_open(
-                        active_backend.name, new_state is CircuitState.OPEN
+                        entry_ref.route_name, new_state is CircuitState.OPEN
                     )
-                    active_metrics.set_backend_health(active_backend.name, True)
+                    active_metrics.set_backend_health(entry_ref.route_name, True)
                     active_metrics.observe_backend_call(
-                        backend=active_backend.name,
+                        backend=entry_ref.route_name,
                         outcome="success",
                         duration_seconds=elapsed_s,
                     )
                 elif cancelled:
-                    if is_half_open_probe:
-                        active_breaker.release_probe()
+                    if selected_probe:
+                        entry_ref.circuit_breaker.release_probe()
                     active_metrics.observe_backend_call(
-                        backend=active_backend.name,
+                        backend=entry_ref.route_name,
                         outcome="cancelled",
                         duration_seconds=time.perf_counter() - started,
                     )
@@ -1029,7 +1275,6 @@ def create_app(
     ) -> JSONResponse:
         request.state.outcome = "validation_error"
         request_id = getattr(request.state, "request_id", sanitize_request_id(None))
-        # Omit raw user input values so prompts or secrets are never echoed into errors/logs.
         issues = [
             {
                 "field": ".".join(str(part) for part in err.get("loc", ())),
@@ -1052,12 +1297,15 @@ def create_app(
     @app.get("/healthz")
     async def healthz(request: Request) -> dict[str, Any]:
         request.state.outcome = "success"
-        return {
+        payload: dict[str, Any] = {
             "status": "ok",
             "version": __version__,
-            "backend": active_backend.name,
+            "backend": active_router.default_route,
             "draining": active_drain.is_draining,
         }
+        if active_router.is_multi_backend:
+            payload["backends"] = [entry.route_name for entry in active_router.entries()]
+        return payload
 
     @app.get("/readyz")
     async def readyz(request: Request) -> JSONResponse:
@@ -1067,88 +1315,73 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 content={
                     "status": "draining",
-                    "backend": active_backend.name,
+                    "backend": active_router.default_route,
                     "detail": "Gateway is shutting down and draining in-flight requests.",
                 },
             )
 
-        snap = active_breaker.snapshot()
-        active_metrics.set_circuit_open(active_backend.name, snap.state is CircuitState.OPEN)
-        if snap.state is CircuitState.OPEN:
-            active_metrics.set_backend_health(active_backend.name, False)
-            request.state.outcome = "circuit_open"
-            return JSONResponse(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={
-                    "status": "not_ready",
-                    "backend": active_backend.name,
-                    "circuit_state": snap.state.value,
-                    "retry_after_seconds": snap.retry_after_seconds,
-                    "detail": (
-                        "Backend circuit breaker is OPEN after consecutive upstream failures."
-                    ),
-                },
+        with active_tracer.start_span(
+            "nexus.backend.health_check",
+            attributes={"nexus.backend": active_router.default_route},
+        ):
+            any_healthy, status_map = await active_router.check_all_health(
+                timeout_seconds=active_settings.limits.health_check_timeout_seconds
             )
 
-        try:
-            with active_tracer.start_span(
-                "nexus.backend.health_check",
-                attributes={"nexus.backend": active_backend.name},
-            ):
-                health = await asyncio.wait_for(
-                    active_backend.health_check(
-                        timeout=active_settings.limits.health_check_timeout_seconds
-                    ),
-                    timeout=active_settings.limits.health_check_timeout_seconds + 0.5,
+        for route_name, info in status_map.items():
+            active_metrics.set_backend_health(route_name, bool(info["healthy"]))
+            active_metrics.set_circuit_open(
+                route_name, info.get("circuit_state") == CircuitState.OPEN.value
+            )
+
+        if not active_router.is_multi_backend:
+            sole = status_map[active_router.default_route]
+            if sole["healthy"]:
+                request.state.outcome = "success"
+                return JSONResponse(
+                    status_code=status.HTTP_200_OK,
+                    content={
+                        "status": "ready",
+                        "backend": sole["backend"],
+                        "circuit_state": sole["circuit_state"],
+                        "latency_ms": sole.get("latency_ms"),
+                        "detail": sole["detail"],
+                    },
                 )
-        except asyncio.TimeoutError:
-            active_metrics.set_backend_health(active_backend.name, False)
-            request.state.outcome = "timeout"
+            if sole.get("circuit_state") == CircuitState.OPEN.value:
+                request.state.outcome = "circuit_open"
+            else:
+                request.state.outcome = "backend_unavailable"
+            content: dict[str, Any] = {
+                "status": "not_ready",
+                "backend": sole["backend"],
+                "circuit_state": sole["circuit_state"],
+                "detail": sole["detail"],
+            }
+            if "latency_ms" in sole:
+                content["latency_ms"] = sole["latency_ms"]
+            if "retry_after_seconds" in sole:
+                content["retry_after_seconds"] = sole["retry_after_seconds"]
+            return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=content)
+
+        if any_healthy:
+            request.state.outcome = "success"
             return JSONResponse(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                status_code=status.HTTP_200_OK,
                 content={
-                    "status": "not_ready",
-                    "backend": active_backend.name,
-                    "circuit_state": snap.state.value,
-                    "detail": "Backend health probe timed out.",
-                },
-            )
-        except Exception as exc:
-            active_metrics.set_backend_health(active_backend.name, False)
-            request.state.outcome = "backend_unavailable"
-            return JSONResponse(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={
-                    "status": "not_ready",
-                    "backend": active_backend.name,
-                    "circuit_state": snap.state.value,
-                    "detail": f"Backend health probe failed ({type(exc).__name__}).",
+                    "status": "ready",
+                    "default_backend": active_router.default_route,
+                    "backends": status_map,
                 },
             )
 
-        active_metrics.set_backend_health(active_backend.name, health.healthy)
-        if not health.healthy:
-            request.state.outcome = "backend_unavailable"
-            return JSONResponse(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={
-                    "status": "not_ready",
-                    "backend": health.backend,
-                    "circuit_state": snap.state.value,
-                    "latency_ms": health.latency_ms,
-                    "detail": health.detail,
-                },
-            )
-
-        request.state.outcome = "success"
+        request.state.outcome = "backend_unavailable"
         return JSONResponse(
-            status_code=status.HTTP_200_OK,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={
-                "status": "ready",
-                "backend": health.backend,
-                "circuit_state": snap.state.value,
-                "latency_ms": health.latency_ms,
-                "detail": health.detail,
+                "status": "not_ready",
+                "default_backend": active_router.default_route,
+                "backends": status_map,
             },
         )
 
@@ -1161,16 +1394,7 @@ def create_app(
         request.state.outcome = "success"
         return JSONResponse(
             status_code=status.HTTP_200_OK,
-            content={
-                "object": "list",
-                "data": [
-                    {
-                        "id": active_backend.default_model,
-                        "object": "model",
-                        "owned_by": active_backend.name,
-                    }
-                ],
-            },
+            content={"object": "list", "data": active_router.list_models()},
         )
 
     @app.post("/v1/generate", response_model=None)
@@ -1209,79 +1433,37 @@ def create_app(
         if limit_err is not None:
             return limit_err
 
-        is_half_open_probe, circuit_err = _acquire_circuit_or_reject(request, request_id)
-        if circuit_err is not None:
-            active_concurrency.release()
-            return circuit_err
-
-        backend_req = BackendGenerateRequest(
-            prompt=payload.prompt,
-            model=payload.model or active_backend.default_model,
-            max_tokens=payload.max_tokens,
-            temperature=payload.temperature,
-            stop=tuple(payload.stop or ()),
-        )
-
         if payload.stream:
-            return await _run_streaming(
+            return await _execute_streaming(
                 request=request,
                 request_id=request_id,
                 endpoint="/v1/generate",
-                backend_req=backend_req,
-                is_half_open_probe=is_half_open_probe,
+                requested_model=payload.model,
+                prompt=payload.prompt,
+                max_tokens=payload.max_tokens,
+                temperature=payload.temperature,
+                stop=tuple(payload.stop or ()),
                 openai_format=False,
             )
 
-        started = time.perf_counter()
         try:
-            with active_tracer.start_span(
-                "nexus.backend.generate",
-                attributes={
-                    "nexus.request_id": request_id,
-                    "nexus.backend": active_backend.name,
-                    "nexus.stream": False,
-                    "nexus.auth_scheme": auth_result.auth_scheme,
-                },
-            ):
-                backend_resp = await asyncio.wait_for(
-                    active_backend.generate(
-                        backend_req,
-                        request_id=request_id,
-                        timeout=active_settings.limits.request_timeout_seconds,
-                    ),
-                    timeout=active_settings.limits.request_timeout_seconds,
-                )
-        except asyncio.CancelledError:
-            if is_half_open_probe:
-                active_breaker.release_probe()
-            elapsed_s = time.perf_counter() - started
-            active_metrics.observe_backend_call(
-                backend=active_backend.name, outcome="cancelled", duration_seconds=elapsed_s
-            )
-            raise
-        except Exception as exc:
-            return _backend_error_response(
-                exc,
+            result = await _execute_non_streaming(
                 request=request,
                 request_id=request_id,
-                backend_name=active_backend.name,
-                started=started,
-                is_half_open_probe=is_half_open_probe,
-                breaker=active_breaker,
-                metrics=active_metrics,
+                auth_caller=auth_result,
+                requested_model=payload.model,
+                prompt=payload.prompt,
+                max_tokens=payload.max_tokens,
+                temperature=payload.temperature,
+                stop=tuple(payload.stop or ()),
             )
         finally:
             active_concurrency.release()
 
-        elapsed_s = time.perf_counter() - started
-        new_state = active_breaker.record_success()
-        active_metrics.set_circuit_open(active_backend.name, new_state is CircuitState.OPEN)
-        active_metrics.set_backend_health(active_backend.name, True)
-        active_metrics.observe_backend_call(
-            backend=active_backend.name, outcome="success", duration_seconds=elapsed_s
-        )
-        request.state.outcome = "success"
+        if isinstance(result, JSONResponse):
+            return result
 
+        selected_entry, backend_resp, elapsed_s = result
         usage_resp = (
             TokenUsageResponse(
                 prompt_tokens=backend_resp.usage.prompt_tokens,
@@ -1291,10 +1473,13 @@ def create_app(
             if backend_resp.usage is not None
             else None
         )
+        backend_name = (
+            selected_entry.route_name if active_router.is_multi_backend else backend_resp.backend
+        )
         return GenerateResponse(
             request_id=request_id,
             model=backend_resp.model,
-            backend=backend_resp.backend,
+            backend=backend_name,
             output=backend_resp.output,
             finish_reason=backend_resp.finish_reason,
             usage=usage_resp,
@@ -1362,81 +1547,41 @@ def create_app(
         if limit_err is not None:
             return limit_err
 
-        is_half_open_probe, circuit_err = _acquire_circuit_or_reject(request, request_id)
-        if circuit_err is not None:
-            active_concurrency.release()
-            return circuit_err
-
         chat_messages = tuple(ChatMessage(role=m.role, content=m.content) for m in payload.messages)
-        backend_req = BackendGenerateRequest(
-            prompt=payload.messages[-1].content,
-            model=payload.model or active_backend.default_model,
-            max_tokens=requested_tokens,
-            temperature=payload.temperature,
-            stop=stop_tuple,
-            messages=chat_messages,
-        )
 
         if payload.stream:
-            return await _run_streaming(
+            return await _execute_streaming(
                 request=request,
                 request_id=request_id,
                 endpoint="/v1/chat/completions",
-                backend_req=backend_req,
-                is_half_open_probe=is_half_open_probe,
+                requested_model=payload.model,
+                prompt=payload.messages[-1].content,
+                max_tokens=requested_tokens,
+                temperature=payload.temperature,
+                stop=stop_tuple,
+                messages=chat_messages,
                 openai_format=True,
             )
 
-        started = time.perf_counter()
         try:
-            with active_tracer.start_span(
-                "nexus.backend.generate",
-                attributes={
-                    "nexus.request_id": request_id,
-                    "nexus.backend": active_backend.name,
-                    "nexus.stream": False,
-                    "nexus.auth_scheme": auth_result.auth_scheme,
-                },
-            ):
-                backend_resp = await asyncio.wait_for(
-                    active_backend.generate(
-                        backend_req,
-                        request_id=request_id,
-                        timeout=active_settings.limits.request_timeout_seconds,
-                    ),
-                    timeout=active_settings.limits.request_timeout_seconds,
-                )
-        except asyncio.CancelledError:
-            if is_half_open_probe:
-                active_breaker.release_probe()
-            elapsed_s = time.perf_counter() - started
-            active_metrics.observe_backend_call(
-                backend=active_backend.name, outcome="cancelled", duration_seconds=elapsed_s
-            )
-            raise
-        except Exception as exc:
-            return _backend_error_response(
-                exc,
+            result = await _execute_non_streaming(
                 request=request,
                 request_id=request_id,
-                backend_name=active_backend.name,
-                started=started,
-                is_half_open_probe=is_half_open_probe,
-                breaker=active_breaker,
-                metrics=active_metrics,
+                auth_caller=auth_result,
+                requested_model=payload.model,
+                prompt=payload.messages[-1].content,
+                max_tokens=requested_tokens,
+                temperature=payload.temperature,
+                stop=stop_tuple,
+                messages=chat_messages,
             )
         finally:
             active_concurrency.release()
 
-        elapsed_s = time.perf_counter() - started
-        new_state = active_breaker.record_success()
-        active_metrics.set_circuit_open(active_backend.name, new_state is CircuitState.OPEN)
-        active_metrics.set_backend_health(active_backend.name, True)
-        active_metrics.observe_backend_call(
-            backend=active_backend.name, outcome="success", duration_seconds=elapsed_s
-        )
-        request.state.outcome = "success"
+        if isinstance(result, JSONResponse):
+            return result
 
+        _selected_entry, backend_resp, _elapsed_s = result
         usage_obj = (
             TokenUsageResponse(
                 prompt_tokens=backend_resp.usage.prompt_tokens,

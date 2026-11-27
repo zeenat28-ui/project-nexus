@@ -1,4 +1,4 @@
-"""Inference backend adapters for Project Nexus."""
+"""Inference backend adapters and multi-backend router for Project Nexus."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from project_nexus.backends.base import (
 from project_nexus.backends.factory import create_backend
 from project_nexus.backends.mock import MockBackend
 from project_nexus.backends.openai_compat import OpenAICompatibleBackend
+from project_nexus.backends.router import BackendRouter, RoutedBackendEntry
 
 __all__ = [
     "BackendClientError",
@@ -27,6 +28,7 @@ __all__ = [
     "BackendGenerateResponse",
     "BackendHealth",
     "BackendResponseError",
+    "BackendRouter",
     "BackendStreamChunk",
     "BackendTimeoutError",
     "BackendUnavailableError",
@@ -34,6 +36,7 @@ __all__ = [
     "InferenceBackend",
     "MockBackend",
     "OpenAICompatibleBackend",
+    "RoutedBackendEntry",
     "TokenUsage",
     "create_backend",
 ]

@@ -14,11 +14,11 @@ import uvicorn
 
 from project_nexus import __version__
 from project_nexus.app import create_app, create_metrics_app
-from project_nexus.backends import create_backend
+from project_nexus.backends import BackendRouter
 from project_nexus.config import ConfigError, NexusSettings, load_settings
 from project_nexus.gpu import HardwareDetectionReport, detect_gpu_capabilities
 from project_nexus.metrics import NexusMetrics
-from project_nexus.verify import verify_backend
+from project_nexus.verify import benchmark_backend, verify_backend
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -41,7 +41,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     probe_parser = subparsers.add_parser(
         "probe",
-        help="Run a single readiness health check against the configured backend.",
+        help="Run a readiness health check against all configured backends.",
     )
     probe_parser.add_argument("--config", help="Path to YAML or TOML configuration file.")
 
@@ -50,6 +50,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run health, non-streaming, and streaming verification checks against a backend.",
     )
     verify_parser.add_argument("--config", help="Path to YAML or TOML configuration file.")
+    verify_parser.add_argument(
+        "--backend",
+        dest="backend_name",
+        help="Optional named backend pool when using multi-backend config.",
+    )
     verify_parser.add_argument(
         "--iterations",
         type=int,
@@ -61,6 +66,40 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=32,
         help="max_tokens used during verification requests (default: 32).",
+    )
+
+    bench_parser = subparsers.add_parser(
+        "benchmark",
+        help="Run a bounded-concurrency latency and throughput benchmark against a backend.",
+    )
+    bench_parser.add_argument("--config", help="Path to YAML or TOML configuration file.")
+    bench_parser.add_argument(
+        "--backend",
+        dest="backend_name",
+        help="Optional named backend pool when using multi-backend config.",
+    )
+    bench_parser.add_argument(
+        "--requests",
+        type=int,
+        default=10,
+        help="Total requests to dispatch (default: 10).",
+    )
+    bench_parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=2,
+        help="Maximum concurrent in-flight requests (default: 2).",
+    )
+    bench_parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Benchmark SSE streaming mode and report TTFT percentiles.",
+    )
+    bench_parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=48,
+        help="max_tokens per benchmark request (default: 48).",
     )
 
     gpu_parser = subparsers.add_parser(
@@ -170,17 +209,27 @@ async def _serve_async(settings: NexusSettings) -> None:
 
 
 async def _run_probe(settings: NexusSettings) -> dict[str, Any]:
-    backend = create_backend(settings.backend)
-    await backend.startup()
+    router = BackendRouter.from_settings(settings)
+    await router.startup()
     try:
-        health = await backend.health_check(timeout=settings.limits.health_check_timeout_seconds)
+        any_healthy, status_map = await router.check_all_health(
+            timeout_seconds=settings.limits.health_check_timeout_seconds
+        )
     finally:
-        await backend.shutdown()
+        await router.shutdown()
+
+    if not router.is_multi_backend:
+        sole = status_map[router.default_route]
+        return {
+            "healthy": bool(sole["healthy"]),
+            "backend": sole["backend"],
+            "latency_ms": sole.get("latency_ms"),
+            "detail": sole["detail"],
+        }
     return {
-        "healthy": health.healthy,
-        "backend": health.backend,
-        "latency_ms": health.latency_ms,
-        "detail": health.detail,
+        "healthy": any_healthy,
+        "default_backend": router.default_route,
+        "backends": status_map,
     }
 
 
@@ -233,15 +282,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.iterations < 1 or args.max_tokens < 1:
             print("Error: --iterations and --max-tokens must be >= 1.", file=sys.stderr)
             return 2
-        vreport = asyncio.run(
-            verify_backend(
-                settings,
-                iterations=args.iterations,
-                max_tokens=args.max_tokens,
+        try:
+            vreport = asyncio.run(
+                verify_backend(
+                    settings,
+                    backend_name=args.backend_name,
+                    iterations=args.iterations,
+                    max_tokens=args.max_tokens,
+                )
             )
-        )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
         print(json.dumps(vreport.to_dict(), indent=2))
         return 0 if vreport.overall_passed else 1
+
+    if args.command == "benchmark":
+        if args.requests < 1 or args.concurrency < 1 or args.max_tokens < 1:
+            print(
+                "Error: --requests, --concurrency, and --max-tokens must be >= 1.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            breport = asyncio.run(
+                benchmark_backend(
+                    settings,
+                    backend_name=args.backend_name,
+                    total_requests=args.requests,
+                    concurrency=args.concurrency,
+                    stream=args.stream,
+                    max_tokens=args.max_tokens,
+                )
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(breport.to_dict(), indent=2))
+        return 0 if breport.failed == 0 else 1
 
     if args.command == "serve":
         try:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "project-nexus"
-version = "0.1.0"
+version = "0.2.0"
 description = "Control and integration gateway for operating LLM inference servers across CPU, NVIDIA CUDA, and AMD ROCm backends."
 readme = "README.md"
 license = "Apache-2.0"
@@ -25,16 +25,22 @@ dependencies = [
 [project.optional-dependencies]
 otel = [
     "opentelemetry-api>=1.25.0,<2.0.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.25.0,<2.0.0",
     "opentelemetry-sdk>=1.25.0,<2.0.0",
+]
+redis = [
+    "redis>=5.0.0,<8.0.0",
 ]
 dev = [
     "build>=1.2.1,<2.0.0",
     "mypy>=1.11.0,<2.0.0",
     "opentelemetry-api>=1.25.0,<2.0.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.25.0,<2.0.0",
     "opentelemetry-sdk>=1.25.0,<2.0.0",
     "pytest>=8.2.0,<10.0.0",
     "pytest-asyncio>=0.23.0,<2.0.0",
     "pytest-cov>=5.0.0,<8.0.0",
+    "redis>=5.0.0,<8.0.0",
     "ruff>=0.6.0,<1.0.0",
     "twine>=5.1.0,<7.0.0",
     "types-PyYAML>=6.0.12.20240808",

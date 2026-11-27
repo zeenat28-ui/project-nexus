@@ -10,6 +10,7 @@ Precedence (lowest to highest):
 from __future__ import annotations
 
 import os
+import re
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -25,6 +26,7 @@ else:  # pragma: no cover - Python 3.10 fallback
     import tomli as tomllib  # type: ignore[import-not-found,unused-ignore]
 
 AllowedJWTAlgorithm = Literal["RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "EdDSA"]
+_POOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 class ConfigError(ValueError):
@@ -120,6 +122,17 @@ class BackendSettings(BaseModel):
         return self
 
 
+class RoutingSettings(BaseModel):
+    """Optional multi-backend model routing and explicit failover policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_backend: str | None = None
+    model_routes: dict[str, str] = Field(default_factory=dict)
+    enable_failover: bool = False
+    fallback_order: list[str] = Field(default_factory=list)
+
+
 class JWTAuthSettings(BaseModel):
     """Asymmetric OIDC/JWT verification settings."""
 
@@ -196,9 +209,28 @@ class LimitsSettings(BaseModel):
     request_timeout_seconds: float = Field(default=35.0, gt=0.0, le=600.0)
     health_check_timeout_seconds: float = Field(default=3.0, gt=0.0, le=60.0)
     max_concurrent_requests: int = Field(default=64, ge=1, le=10_000)
+    rate_limit_backend: Literal["memory", "redis"] = "memory"
     rate_limit_requests_per_minute: int = Field(default=0, ge=0, le=1_000_000)
     rate_limit_burst: int | None = Field(default=None, ge=1, le=100_000)
     max_tracked_callers: int = Field(default=10_000, ge=10, le=1_000_000)
+    rate_limit_redis_url: SecretStr | None = None
+    rate_limit_redis_fail_open: bool = True
+    rate_limit_redis_timeout_seconds: float = Field(default=1.0, gt=0.0, le=10.0)
+
+    @model_validator(mode="after")
+    def validate_rate_limit_backend(self) -> LimitsSettings:
+        if self.rate_limit_backend == "redis" and self.rate_limit_requests_per_minute > 0:
+            if self.rate_limit_redis_url is None:
+                raise ValueError(
+                    "limits.rate_limit_redis_url (or NEXUS_LIMITS_RATE_LIMIT_REDIS_URL) is "
+                    "required when limits.rate_limit_backend='redis' and rate limiting is enabled"
+                )
+            parsed = urlparse(self.rate_limit_redis_url.get_secret_value())
+            if parsed.scheme not in {"redis", "rediss"} or not parsed.netloc:
+                raise ValueError(
+                    "limits.rate_limit_redis_url must be a valid redis:// or rediss:// URL"
+                )
+        return self
 
 
 class CircuitBreakerSettings(BaseModel):
@@ -220,12 +252,23 @@ class LoggingSettings(BaseModel):
 
 
 class TracingSettings(BaseModel):
-    """Optional OpenTelemetry tracing settings."""
+    """Optional OpenTelemetry tracing and OTLP export settings."""
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
     service_name: str = Field(default="project-nexus", min_length=1, max_length=128)
+    otlp_endpoint: str | None = None
+    sample_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
+    otlp_timeout_seconds: float = Field(default=5.0, gt=0.0, le=60.0)
+
+    @model_validator(mode="after")
+    def validate_otlp_endpoint(self) -> TracingSettings:
+        if self.otlp_endpoint is not None:
+            parsed = urlparse(self.otlp_endpoint)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("tracing.otlp_endpoint must be a valid http:// or https:// URL")
+        return self
 
 
 class MetricsSettings(BaseModel):
@@ -262,6 +305,8 @@ class NexusSettings(BaseModel):
 
     server: ServerSettings = Field(default_factory=ServerSettings)
     backend: BackendSettings = Field(default_factory=BackendSettings)
+    backends: dict[str, BackendSettings] = Field(default_factory=dict)
+    routing: RoutingSettings = Field(default_factory=RoutingSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
     limits: LimitsSettings = Field(default_factory=LimitsSettings)
     circuit_breaker: CircuitBreakerSettings = Field(default_factory=CircuitBreakerSettings)
@@ -280,6 +325,46 @@ class NexusSettings(BaseModel):
                 "metrics.port cannot equal server.port when bound to the same host in "
                 "metrics.mode='separate'"
             )
+
+        if self.backends:
+            for pool_name in self.backends:
+                if not _POOL_NAME_PATTERN.fullmatch(pool_name):
+                    raise ValueError(
+                        f"Invalid backend pool name {pool_name!r}; use 1-64 characters from "
+                        "A-Z, a-z, 0-9, '.', '_', '-'."
+                    )
+
+            if self.routing.default_backend is None:
+                self.routing.default_backend = next(iter(self.backends))
+            elif self.routing.default_backend not in self.backends:
+                raise ValueError(
+                    f"routing.default_backend={self.routing.default_backend!r} is not defined "
+                    "under backends."
+                )
+
+            for model_id, target_pool in self.routing.model_routes.items():
+                if target_pool not in self.backends:
+                    raise ValueError(
+                        f"routing.model_routes[{model_id!r}] references unknown backend pool "
+                        f"{target_pool!r}."
+                    )
+
+            for fallback_pool in self.routing.fallback_order:
+                if fallback_pool not in self.backends:
+                    raise ValueError(
+                        f"routing.fallback_order references unknown backend pool {fallback_pool!r}."
+                    )
+        else:
+            if self.routing.model_routes or self.routing.fallback_order:
+                raise ValueError(
+                    "routing.model_routes and routing.fallback_order require named pools "
+                    "configured under backends."
+                )
+            if self.routing.default_backend is not None:
+                raise ValueError(
+                    "routing.default_backend requires named pools configured under backends."
+                )
+
         return self
 
     def to_sanitized_dict(self) -> dict[str, Any]:
@@ -399,6 +484,8 @@ _ENV_MAPPINGS: tuple[
     ("NEXUS_MOCK_LATENCY_MS", ("backend", "mock", "latency_ms"), "float"),
     ("NEXUS_MOCK_MODE", ("backend", "mock", "mode"), "str"),
     ("NEXUS_MOCK_RESPONSE_PREFIX", ("backend", "mock", "response_prefix"), "str"),
+    ("NEXUS_ROUTING_DEFAULT_BACKEND", ("routing", "default_backend"), "str"),
+    ("NEXUS_ROUTING_ENABLE_FAILOVER", ("routing", "enable_failover"), "bool"),
     ("NEXUS_AUTH_MODE", ("auth", "mode"), "str"),
     ("NEXUS_AUTH_API_KEY", ("auth", "api_key"), "str"),
     ("NEXUS_AUTH_API_KEYS", ("auth", "api_keys"), "csv"),
@@ -416,14 +503,19 @@ _ENV_MAPPINGS: tuple[
         "float",
     ),
     ("NEXUS_LIMITS_MAX_CONCURRENT_REQUESTS", ("limits", "max_concurrent_requests"), "int"),
+    ("NEXUS_LIMITS_RATE_LIMIT_BACKEND", ("limits", "rate_limit_backend"), "str"),
     ("NEXUS_LIMITS_RATE_LIMIT_RPM", ("limits", "rate_limit_requests_per_minute"), "int"),
     ("NEXUS_LIMITS_RATE_LIMIT_BURST", ("limits", "rate_limit_burst"), "int"),
+    ("NEXUS_LIMITS_RATE_LIMIT_REDIS_URL", ("limits", "rate_limit_redis_url"), "str"),
+    ("NEXUS_LIMITS_RATE_LIMIT_REDIS_FAIL_OPEN", ("limits", "rate_limit_redis_fail_open"), "bool"),
     ("NEXUS_CIRCUIT_BREAKER_FAILURE_THRESHOLD", ("circuit_breaker", "failure_threshold"), "int"),
     ("NEXUS_CIRCUIT_BREAKER_COOLDOWN_SECONDS", ("circuit_breaker", "cooldown_seconds"), "float"),
     ("NEXUS_LOG_LEVEL", ("logging", "level"), "upper"),
     ("NEXUS_LOG_FORMAT", ("logging", "format"), "str"),
     ("NEXUS_TRACING_ENABLED", ("tracing", "enabled"), "bool"),
     ("NEXUS_TRACING_SERVICE_NAME", ("tracing", "service_name"), "str"),
+    ("NEXUS_TRACING_OTLP_ENDPOINT", ("tracing", "otlp_endpoint"), "str"),
+    ("NEXUS_TRACING_SAMPLE_RATIO", ("tracing", "sample_ratio"), "float"),
     ("NEXUS_METRICS_MODE", ("metrics", "mode"), "str"),
     ("NEXUS_METRICS_HOST", ("metrics", "host"), "str"),
     ("NEXUS_METRICS_PORT", ("metrics", "port"), "int"),
@@ -438,7 +530,9 @@ _EMPTY_TO_NONE_PATHS: frozenset[tuple[str, ...]] = frozenset(
         ("backend", "ca_bundle_path"),
         ("backend", "client_cert_path"),
         ("backend", "client_key_path"),
+        ("limits", "rate_limit_redis_url"),
         ("metrics", "bearer_token"),
+        ("tracing", "otlp_endpoint"),
     }
 )
 

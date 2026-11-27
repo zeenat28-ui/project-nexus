@@ -1,12 +1,13 @@
-"""Repeatable backend verification harness for local and CUDA/ROCm staging pilots.
+"""Repeatable backend verification and concurrent benchmark harness.
 
-Runs health checks, non-streaming latency sweeps, and SSE streaming checks
-against the configured backend and combines them with host GPU detection into a
-structured JSON report without logging secrets.
+Runs health checks, non-streaming latency sweeps, SSE streaming checks, and
+bounded-concurrency benchmarks against configured backends without logging
+secrets.
 """
 
 from __future__ import annotations
 
+import asyncio
 import math
 import time
 from dataclasses import asdict, dataclass
@@ -15,8 +16,8 @@ from typing import Any
 from project_nexus.backends import (
     BackendError,
     BackendGenerateRequest,
+    BackendRouter,
     InferenceBackend,
-    create_backend,
 )
 from project_nexus.config import NexusSettings
 from project_nexus.gpu import detect_gpu_capabilities
@@ -34,12 +35,13 @@ class CheckOutcome:
 
 @dataclass(frozen=True)
 class LatencySummary:
-    """Summary percentiles for non-streaming verification requests."""
+    """Summary percentiles for verification or benchmark requests."""
 
     samples: int
     min_ms: float
     p50_ms: float
     p95_ms: float
+    p99_ms: float
     max_ms: float
 
 
@@ -59,6 +61,27 @@ class VerificationReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class BenchmarkReport:
+    """Structured concurrent load benchmark report."""
+
+    backend: str
+    model: str
+    stream: bool
+    total_requests: int
+    concurrency: int
+    succeeded: int
+    failed: int
+    error_rate: float
+    wall_time_seconds: float
+    requests_per_second: float
+    latency_summary: LatencySummary | None
+    ttft_summary: LatencySummary | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _percentile(sorted_values: list[float], pct: float) -> float:
     if not sorted_values:
         return 0.0
@@ -66,10 +89,41 @@ def _percentile(sorted_values: list[float], pct: float) -> float:
     return round(sorted_values[idx], 2)
 
 
+def _summarize_latencies(values: list[float]) -> LatencySummary | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return LatencySummary(
+        samples=len(ordered),
+        min_ms=round(ordered[0], 2),
+        p50_ms=_percentile(ordered, 0.50),
+        p95_ms=_percentile(ordered, 0.95),
+        p99_ms=_percentile(ordered, 0.99),
+        max_ms=round(ordered[-1], 2),
+    )
+
+
+def _resolve_target_backend(
+    settings: NexusSettings,
+    *,
+    backend_name: str | None = None,
+) -> tuple[str, InferenceBackend]:
+    router = BackendRouter.from_settings(settings)
+    if backend_name is not None:
+        if backend_name not in {e.route_name for e in router.entries()}:
+            available = ", ".join(e.route_name for e in router.entries())
+            raise ValueError(f"Unknown backend pool {backend_name!r}. Available: {available}")
+        entry = router.get(backend_name)
+    else:
+        entry = router.default_entry
+    return entry.route_name, entry.backend
+
+
 async def verify_backend(
     settings: NexusSettings,
     *,
     backend: InferenceBackend | None = None,
+    backend_name: str | None = None,
     iterations: int = 3,
     prompt: str = "Reply with a short confirmation that inference is operational.",
     max_tokens: int = 32,
@@ -78,15 +132,20 @@ async def verify_backend(
     if iterations < 1:
         raise ValueError("iterations must be >= 1")
 
-    active_backend = backend or create_backend(settings.backend)
-    owns_backend = backend is None
+    if backend is not None:
+        resolved_name = backend.name
+        active_backend = backend
+        owns_backend = False
+    else:
+        resolved_name, active_backend = _resolve_target_backend(settings, backend_name=backend_name)
+        owns_backend = True
+
     checks: list[CheckOutcome] = []
     latencies_ms: list[float] = []
 
     if owns_backend:
         await active_backend.startup()
     try:
-        # 1. Health probe
         health = await active_backend.health_check(
             timeout=settings.limits.health_check_timeout_seconds
         )
@@ -99,7 +158,6 @@ async def verify_backend(
             )
         )
 
-        # 2. Non-streaming generation iterations
         gen_passed = True
         gen_detail = f"Completed {iterations} non-streaming request(s)."
         req = BackendGenerateRequest(
@@ -138,7 +196,6 @@ async def verify_backend(
             )
         )
 
-        # 3. Streaming generation check
         stream_started = time.perf_counter()
         ttft_ms: float | None = None
         chunk_count = 0
@@ -182,28 +239,117 @@ async def verify_backend(
         if owns_backend:
             await active_backend.shutdown()
 
-    latency_summary: LatencySummary | None = None
-    if latencies_ms:
-        ordered = sorted(latencies_ms)
-        latency_summary = LatencySummary(
-            samples=len(ordered),
-            min_ms=round(ordered[0], 2),
-            p50_ms=_percentile(ordered, 0.50),
-            p95_ms=_percentile(ordered, 0.95),
-            max_ms=round(ordered[-1], 2),
-        )
-
     gpu_report = detect_gpu_capabilities().to_dict()
     overall = all(item.passed for item in checks)
     return VerificationReport(
         overall_passed=overall,
-        backend=active_backend.name,
+        backend=resolved_name,
         model=active_backend.default_model,
         checks=tuple(checks),
-        latency_summary=latency_summary,
+        latency_summary=_summarize_latencies(latencies_ms),
         host_gpu=gpu_report,
         note=(
             "Verification reflects only the configured backend endpoint and local host GPU "
             "visibility at execution time."
         ),
+    )
+
+
+async def benchmark_backend(
+    settings: NexusSettings,
+    *,
+    backend: InferenceBackend | None = None,
+    backend_name: str | None = None,
+    total_requests: int = 10,
+    concurrency: int = 2,
+    stream: bool = False,
+    prompt: str = "Summarize the benefits of structured observability in one sentence.",
+    max_tokens: int = 48,
+) -> BenchmarkReport:
+    """Run a bounded-concurrency latency and throughput benchmark against a backend."""
+    if total_requests < 1:
+        raise ValueError("total_requests must be >= 1")
+    if concurrency < 1:
+        raise ValueError("concurrency must be >= 1")
+
+    if backend is not None:
+        resolved_name = backend.name
+        active_backend = backend
+        owns_backend = False
+    else:
+        resolved_name, active_backend = _resolve_target_backend(settings, backend_name=backend_name)
+        owns_backend = True
+
+    req = BackendGenerateRequest(
+        prompt=prompt,
+        model=active_backend.default_model,
+        max_tokens=max_tokens,
+        temperature=0.0,
+    )
+    semaphore = asyncio.Semaphore(concurrency)
+    latencies_ms: list[float] = []
+    ttfts_ms: list[float] = []
+    succeeded = 0
+    failed = 0
+
+    async def _run_one(idx: int) -> None:
+        nonlocal succeeded, failed
+        async with semaphore:
+            started = time.perf_counter()
+            try:
+                if stream:
+                    first_token_ms: float | None = None
+                    got_text = False
+                    async for chunk in active_backend.generate_stream(
+                        req,
+                        request_id=f"nexus-bench-{idx + 1}",
+                        timeout=settings.limits.request_timeout_seconds,
+                    ):
+                        if chunk.delta:
+                            got_text = True
+                            if first_token_ms is None:
+                                first_token_ms = round((time.perf_counter() - started) * 1000.0, 2)
+                    if not got_text:
+                        failed += 1
+                        return
+                    if first_token_ms is not None:
+                        ttfts_ms.append(first_token_ms)
+                else:
+                    resp = await active_backend.generate(
+                        req,
+                        request_id=f"nexus-bench-{idx + 1}",
+                        timeout=settings.limits.request_timeout_seconds,
+                    )
+                    if not resp.output.strip():
+                        failed += 1
+                        return
+            except BackendError:
+                failed += 1
+                return
+            latencies_ms.append(round((time.perf_counter() - started) * 1000.0, 2))
+            succeeded += 1
+
+    if owns_backend:
+        await active_backend.startup()
+    wall_start = time.perf_counter()
+    try:
+        await asyncio.gather(*(_run_one(i) for i in range(total_requests)))
+    finally:
+        wall_elapsed = max(1e-6, time.perf_counter() - wall_start)
+        if owns_backend:
+            await active_backend.shutdown()
+
+    return BenchmarkReport(
+        backend=resolved_name,
+        model=active_backend.default_model,
+        stream=stream,
+        total_requests=total_requests,
+        concurrency=concurrency,
+        succeeded=succeeded,
+        failed=failed,
+        error_rate=round(failed / total_requests, 4),
+        wall_time_seconds=round(wall_elapsed, 4),
+        requests_per_second=round(succeeded / wall_elapsed, 2),
+        latency_summary=_summarize_latencies(latencies_ms),
+        ttft_summary=_summarize_latencies(ttfts_ms) if stream else None,
     )

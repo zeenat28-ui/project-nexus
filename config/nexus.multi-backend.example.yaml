@@ -1,0 +1,79 @@
+# Example multi-backend routing configuration pairing separate NVIDIA CUDA and
+# AMD ROCm OpenAI-compatible inference servers behind a single Nexus gateway.
+#
+# Each backend pool runs its own isolated upstream GPU runtime and has its own
+# independent circuit breaker. Project Nexus never mixes NVIDIA and AMD GPUs
+# inside a single inference process.
+#
+# Supply credentials via environment variables (do not commit secrets here):
+#   NEXUS_AUTH_API_KEY
+#   NEXUS_METRICS_BEARER_TOKEN
+#   NEXUS_LIMITS_RATE_LIMIT_REDIS_URL  (if using rate_limit_backend: redis)
+
+server:
+  host: "127.0.0.1"
+  port: 8000
+  shutdown_drain_seconds: 15.0
+
+backends:
+  cuda-pool:
+    type: "openai_compatible"
+    base_url: "http://vllm-cuda.inference.svc.cluster.local:8000"
+    model: "Qwen/Qwen2.5-7B-Instruct"
+    api_style: "chat_completions"
+    health_path: "/health"
+    connect_timeout_seconds: 5.0
+    read_timeout_seconds: 30.0
+    verify_tls: true
+
+  rocm-pool:
+    type: "openai_compatible"
+    base_url: "http://vllm-rocm.inference.svc.cluster.local:8000"
+    model: "meta-llama/Llama-3.1-8B-Instruct"
+    api_style: "chat_completions"
+    health_path: "/health"
+    connect_timeout_seconds: 5.0
+    read_timeout_seconds: 30.0
+    verify_tls: true
+
+routing:
+  default_backend: "cuda-pool"
+  model_routes:
+    "Qwen/Qwen2.5-7B-Instruct": "cuda-pool"
+    "meta-llama/Llama-3.1-8B-Instruct": "rocm-pool"
+  # Opt-in failover when the target pool's circuit is OPEN or hits a retryable fault.
+  # Leave false unless all pools in fallback_order serve compatible models/behavior.
+  enable_failover: false
+  fallback_order:
+    - "cuda-pool"
+    - "rocm-pool"
+
+limits:
+  max_request_bytes: 65536
+  max_prompt_chars: 16384
+  max_tokens_limit: 2048
+  request_timeout_seconds: 35.0
+  health_check_timeout_seconds: 3.0
+  max_concurrent_requests: 64
+  rate_limit_backend: "memory"    # set "redis" + NEXUS_LIMITS_RATE_LIMIT_REDIS_URL for HA sync
+  rate_limit_requests_per_minute: 240
+  rate_limit_burst: 40
+
+circuit_breaker:
+  failure_threshold: 3
+  cooldown_seconds: 15.0
+
+logging:
+  level: "INFO"
+  format: "json"
+
+tracing:
+  enabled: false
+  service_name: "project-nexus"
+  # otlp_endpoint: "https://otel-collector.monitoring.svc.cluster.local:4318/v1/traces"
+  sample_ratio: 1.0
+
+metrics:
+  mode: "separate"
+  host: "127.0.0.1"
+  port: 9090
