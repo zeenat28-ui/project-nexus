@@ -55,6 +55,9 @@ backends:
 
 routing:
   default_backend: "rocm-pool"
+  # Poll upstream vLLM /metrics every 5s in the background so KV-cache pressure
+  # triggers spillover even between Kubernetes readiness probes.
+  telemetry_poll_interval_seconds: 5.0
   # Route one shared model across both ROCm and CUDA pools:
   # cost_aware picks lower cost_tier (rocm-pool) first and automatically spills
   # over to cuda-pool if rocm-pool's KV-cache exceeds 90% or its circuit opens.
@@ -70,6 +73,7 @@ routing:
 
 metering:
   enabled: true
+  backend: "memory"        # memory | sqlite | redis (use redis + NEXUS_METERING_REDIS_URL for HA)
   window_seconds: 86400
   # sqlite_path: "/var/lib/nexus/usage.sqlite3"
   default_prompt_cost_per_1k_usd: 0.0002

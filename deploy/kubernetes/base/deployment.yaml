@@ -13,7 +13,7 @@ metadata:
   labels:
     app.kubernetes.io/name: nexus-gateway
     app.kubernetes.io/component: gateway
-    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/version: "0.4.0"
 spec:
   replicas: 1
   revisionHistoryLimit: 3
@@ -25,7 +25,7 @@ spec:
       labels:
         app.kubernetes.io/name: nexus-gateway
         app.kubernetes.io/component: gateway
-        app.kubernetes.io/version: "0.3.0"
+        app.kubernetes.io/version: "0.4.0"
     spec:
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
@@ -39,7 +39,7 @@ spec:
       containers:
         - name: nexus-gateway
           # Replace with your registry image and pin by @sha256:... digest for production.
-          image: ghcr.io/zeenat28-ui/project-nexus:0.3.0
+          image: ghcr.io/zeenat28-ui/project-nexus:0.4.0
           imagePullPolicy: IfNotPresent
           args:
             - "serve"

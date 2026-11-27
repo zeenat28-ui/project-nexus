@@ -4,8 +4,8 @@
 
 | Version | Supported |
 | --- | --- |
-| `0.3.x` | Yes |
-| `0.2.x` | Security fixes via upgrade to `0.3.x` |
+| `0.4.x` | Yes |
+| `0.3.x` | Security fixes via upgrade to `0.4.x` |
 
 ## Reporting a Vulnerability
 

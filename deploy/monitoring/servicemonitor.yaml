@@ -1,0 +1,23 @@
+# Prometheus Operator ServiceMonitor scraping Project Nexus's dedicated
+# internal metrics port (9090) using bearer token authentication.
+# Requires monitoring.coreos.com/v1 CRDs (kube-prometheus-stack).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nexus-gateway
+  labels:
+    app.kubernetes.io/name: nexus-gateway
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nexus-gateway
+      app.kubernetes.io/component: metrics
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 5s
+      scheme: http
+      bearerTokenSecret:
+        name: nexus-gateway-secrets
+        key: metrics-bearer-token

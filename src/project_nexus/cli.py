@@ -19,6 +19,7 @@ from project_nexus.app import create_app, create_metrics_app
 from project_nexus.backends import BackendRouter
 from project_nexus.config import ConfigError, NexusSettings, load_settings
 from project_nexus.gpu import HardwareDetectionReport, detect_gpu_capabilities
+from project_nexus.loadtest import run_gateway_load_test
 from project_nexus.metrics import NexusMetrics
 from project_nexus.verify import benchmark_backend, verify_backend
 
@@ -103,6 +104,53 @@ def _build_parser() -> argparse.ArgumentParser:
         default=48,
         help="max_tokens per benchmark request (default: 48).",
     )
+
+    load_parser = subparsers.add_parser(
+        "load-test",
+        help="Run a live HTTP/HTTPS concurrent load test against a running Nexus gateway.",
+    )
+    load_parser.add_argument(
+        "--url",
+        required=True,
+        help="Target Nexus gateway base URL (e.g., https://127.0.0.1:8000).",
+    )
+    load_parser.add_argument(
+        "--endpoint",
+        choices=["/v1/generate", "/v1/chat/completions"],
+        default="/v1/generate",
+        help="Gateway inference endpoint to load-test (default: /v1/generate).",
+    )
+    load_parser.add_argument(
+        "--requests",
+        type=int,
+        default=50,
+        help="Total HTTP requests to execute (default: 50).",
+    )
+    load_parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=10,
+        help="Maximum concurrent HTTP requests (default: 10).",
+    )
+    load_parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Load-test SSE streaming responses and report TTFT percentiles.",
+    )
+    load_parser.add_argument("--model", help="Optional target model override.")
+    load_parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=32,
+        help="max_tokens per request (default: 32).",
+    )
+    load_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="Per-request HTTP timeout in seconds (default: 30.0).",
+    )
+    load_parser.add_argument("--ca-bundle", help="Optional TLS CA bundle path for HTTPS targets.")
 
     gpu_parser = subparsers.add_parser(
         "detect-gpu",
@@ -304,6 +352,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(_format_gpu_report_text(report))
         return 0
+
+    if args.command == "load-test":
+        if args.requests < 1 or args.concurrency < 1 or args.max_tokens < 1 or args.timeout <= 0:
+            print(
+                "Error: --requests, --concurrency, --max-tokens, and --timeout must be positive.",
+                file=sys.stderr,
+            )
+            return 2
+        load_report = asyncio.run(
+            run_gateway_load_test(
+                base_url=args.url,
+                endpoint=args.endpoint,
+                total_requests=args.requests,
+                concurrency=args.concurrency,
+                stream=args.stream,
+                model=args.model,
+                max_tokens=args.max_tokens,
+                timeout_seconds=args.timeout,
+                ca_bundle_path=args.ca_bundle,
+            )
+        )
+        print(json.dumps(load_report.to_dict(), indent=2))
+        return 0 if load_report.failed == 0 else 1
 
     overrides: dict[str, Any] = {}
     if args.command == "serve":

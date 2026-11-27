@@ -1,0 +1,136 @@
+{
+  "title": "Project Nexus — LLM Serving Gateway",
+  "uid": "project-nexus-gateway-v1",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "tags": ["project-nexus", "llm", "mlops"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Gateway Request Rate by Status Class",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum by (status_class, endpoint) (rate(nexus_requests_total[5m]))",
+          "legendFormat": "{{endpoint}} ({{status_class}})"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "End-to-End Inference Latency (p50 / p95 / p99)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, backend) (rate(nexus_request_duration_seconds_bucket{endpoint=~\"/v1/generate|/v1/chat/completions\"}[5m])))",
+          "legendFormat": "p50 {{backend}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, backend) (rate(nexus_request_duration_seconds_bucket{endpoint=~\"/v1/generate|/v1/chat/completions\"}[5m])))",
+          "legendFormat": "p95 {{backend}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, backend) (rate(nexus_request_duration_seconds_bucket{endpoint=~\"/v1/generate|/v1/chat/completions\"}[5m])))",
+          "legendFormat": "p99 {{backend}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Backend Pool Health (1=Healthy)",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "nexus_backend_healthy",
+          "legendFormat": "{{backend}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Circuit Breaker State (1=OPEN)",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 8 },
+      "targets": [
+        {
+          "expr": "nexus_backend_circuit_open",
+          "legendFormat": "{{backend}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Upstream GPU KV-Cache Utilization Ratio",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } },
+      "targets": [
+        {
+          "expr": "nexus_backend_kv_cache_usage_ratio",
+          "legendFormat": "{{backend}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "In-Flight Requests & Active SSE Streams",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        {
+          "expr": "nexus_backend_in_flight_requests",
+          "legendFormat": "in-flight {{backend}}"
+        },
+        {
+          "expr": "nexus_active_streams",
+          "legendFormat": "streams {{endpoint}}"
+        },
+        {
+          "expr": "nexus_backend_queue_depth",
+          "legendFormat": "upstream queue {{backend}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Metered Token Rate & Estimated Cost ($/min)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        {
+          "expr": "sum by (backend, token_type) (rate(nexus_tokens_total[5m]))",
+          "legendFormat": "{{backend}} {{token_type}} tok/s"
+        },
+        {
+          "expr": "sum by (backend) (rate(nexus_estimated_cost_usd_total[5m])) * 60",
+          "legendFormat": "{{backend}} USD/min"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Rate-Limit (429) & Tenant Quota (402) Rejections",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 22 },
+      "targets": [
+        {
+          "expr": "sum by (endpoint, reason) (rate(nexus_rate_limited_total[5m]))",
+          "legendFormat": "429 {{endpoint}} {{reason}}"
+        },
+        {
+          "expr": "sum by (endpoint, reason) (rate(nexus_quota_rejected_total[5m]))",
+          "legendFormat": "402 {{endpoint}} {{reason}}"
+        }
+      ]
+    }
+  ]
+}

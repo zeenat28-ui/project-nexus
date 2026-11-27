@@ -39,6 +39,16 @@ jobs:
       - name: Run Mypy
         run: mypy src
 
+      - name: Run Bandit static security scan
+        run: bandit -r src -ll -ii
+
+      - name: Run pip-audit dependency vulnerability scan
+        run: pip-audit --progress-spinner off
+
+      - name: Validate Grafana dashboard JSON and monitoring YAML
+        run: |
+          python -c "import json, pathlib, yaml; json.loads(pathlib.Path('deploy/monitoring/grafana-dashboard.json').read_text(encoding='utf-8')); [list(yaml.safe_load_all(p.read_text(encoding='utf-8'))) for p in pathlib.Path('deploy/monitoring').glob('*.yaml')]; print('Monitoring artifacts OK')"
+
   test:
     name: Unit Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -111,6 +121,7 @@ jobs:
           kustomize build deploy/kubernetes/base | kubeconform -strict -summary
           kustomize build deploy/kubernetes/overlays/ha | kubeconform -strict -summary
           kubeconform -strict -summary deploy/kubernetes/secret.example.yaml
+          kubeconform -strict -summary deploy/monitoring/metrics-service.yaml
 
   docker-build-and-scan:
     name: Docker Build, Vulnerability Scan & SBOM

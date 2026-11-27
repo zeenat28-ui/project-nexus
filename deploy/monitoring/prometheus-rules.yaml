@@ -1,0 +1,91 @@
+# Prometheus Operator alerting rules aligned with Project Nexus v0.4.0 metrics.
+# Requires monitoring.coreos.com/v1 CRDs (or load the `groups:` section into standard Prometheus).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: nexus-gateway-alerts
+  labels:
+    app.kubernetes.io/name: nexus-gateway
+spec:
+  groups:
+    - name: project-nexus.slo
+      interval: 30s
+      rules:
+        - alert: NexusGatewayHigh5xxRate
+          expr: |
+            (
+              sum(rate(nexus_requests_total{status_class="5xx"}[5m]))
+              /
+              clamp_min(sum(rate(nexus_requests_total[5m])), 1e-6)
+            ) > 0.02
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Project Nexus 5xx error rate exceeds 2%"
+            description: "More than 2% of gateway requests returned 5xx over the last 5 minutes."
+            runbook: "docs/RUNBOOK.md#nexusgatewayhigh5xxrate"
+
+        - alert: NexusBackendCircuitOpen
+          expr: max by (backend) (nexus_backend_circuit_open) == 1
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Nexus backend circuit breaker OPEN ({{ $labels.backend }})"
+            description: "Backend pool {{ $labels.backend }} circuit breaker has remained OPEN for 2m."
+            runbook: "docs/RUNBOOK.md#nexusbackendcircuitopen"
+
+        - alert: NexusBackendUnhealthy
+          expr: min by (backend) (nexus_backend_healthy) == 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Nexus backend pool unhealthy ({{ $labels.backend }})"
+            description: "Readiness checks report backend pool {{ $labels.backend }} unhealthy."
+            runbook: "docs/RUNBOOK.md#nexusbackendunhealthy"
+
+        - alert: NexusHighP95Latency
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le, endpoint, backend) (rate(nexus_request_duration_seconds_bucket{endpoint=~"/v1/generate|/v1/chat/completions"}[5m]))
+            ) > 10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High p95 inference latency on {{ $labels.backend }}"
+            description: "p95 latency on {{ $labels.endpoint }} ({{ $labels.backend }}) exceeded 10s for 5m."
+            runbook: "docs/RUNBOOK.md#nexushighp95latency"
+
+        - alert: NexusGPUKVCacheSaturated
+          expr: max by (backend) (nexus_backend_kv_cache_usage_ratio) > 0.90
+          for: 3m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Upstream GPU KV-cache > 90% on {{ $labels.backend }}"
+            description: "Pool {{ $labels.backend }} KV-cache utilization exceeds 90%; spillover or scaling required."
+            runbook: "docs/RUNBOOK.md#nexusgpukvcachesaturated"
+
+        - alert: NexusHighRateLimitRejections
+          expr: sum by (reason) (rate(nexus_rate_limited_total[5m])) > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Elevated rate/concurrency rejections ({{ $labels.reason }})"
+            description: "More than 5 req/s rejected due to {{ $labels.reason }} over 5m."
+            runbook: "docs/RUNBOOK.md#nexushighratelimitrejections"
+
+        - alert: NexusTenantQuotaExhausted
+          expr: sum by (reason) (increase(nexus_quota_rejected_total[15m])) > 0
+          for: 1m
+          labels:
+            severity: info
+          annotations:
+            summary: "Tenant quota rejections recorded ({{ $labels.reason }})"
+            description: "One or more tenants received HTTP 402 due to {{ $labels.reason }} in the last 15m."
+            runbook: "docs/RUNBOOK.md#nexustenantquotaexhausted"

@@ -14,7 +14,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: project-nexus:0.3.0-local
+    image: project-nexus:0.4.0-local
     ports:
       - "127.0.0.1:8000:8000"
     environment:

@@ -526,7 +526,7 @@ def create_metrics_app(
     usage_meter: UsageMeter | None = None,
     router: BackendRouter | None = None,
 ) -> FastAPI:
-    """Create the internal app exposing ``/metrics``, ``/admin/usage``, and ``/admin/fleet``."""
+    """Create the internal ASGI app for ``/metrics``, ``/admin/usage``, and ``/admin/fleet``."""
     metrics_app = FastAPI(
         title="Project Nexus Internal Metrics & Admin",
         version=__version__,
@@ -715,6 +715,12 @@ def _build_usage_meter(settings: NexusSettings) -> UsageMeter:
         )
         for tid, q in m.tenants.items()
     }
+    redis_url = (
+        m.redis_url.get_secret_value()
+        if (m.backend == "redis" and m.redis_url is not None)
+        else None
+    )
+    sqlite_path = m.sqlite_path if m.backend in {"memory", "sqlite"} else None
     return UsageMeter(
         enabled=m.enabled,
         window_seconds=m.window_seconds,
@@ -728,7 +734,10 @@ def _build_usage_meter(settings: NexusSettings) -> UsageMeter:
             max_cost_usd_per_window=m.default_max_cost_usd_per_window,
         ),
         tenant_budgets=tenant_budgets,
-        sqlite_path=m.sqlite_path,
+        sqlite_path=sqlite_path,
+        redis_url=redis_url,
+        redis_fail_open=m.redis_fail_open,
+        redis_timeout_seconds=m.redis_timeout_seconds,
     )
 
 
@@ -810,6 +819,27 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await active_router.startup()
+        poll_interval = active_settings.routing.telemetry_poll_interval_seconds
+        poller_task: asyncio.Task[None] | None = None
+
+        async def _poll_telemetry_loop() -> None:
+            while True:
+                for entry in active_router.entries():
+                    tel = await entry.backend.scrape_telemetry(
+                        timeout=active_settings.limits.health_check_timeout_seconds
+                    )
+                    if tel is not None:
+                        entry.stats.update_telemetry(tel)
+                        active_metrics.set_backend_telemetry(
+                            entry.route_name,
+                            kv_cache_usage_ratio=tel.kv_cache_usage_ratio,
+                            queue_depth=tel.queue_depth,
+                        )
+                await asyncio.sleep(poll_interval)
+
+        if poll_interval > 0.0:
+            poller_task = asyncio.create_task(_poll_telemetry_loop())
+
         if not active_auth.is_enforced:
             logger.warning(
                 "Gateway authentication is not configured; protect inference endpoints behind TLS "
@@ -832,6 +862,10 @@ def create_app(
         try:
             yield
         finally:
+            if poller_task is not None:
+                poller_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await poller_task
             active_drain.begin_drain()
             drained = await active_drain.wait_for_idle(
                 timeout_seconds=active_settings.server.shutdown_drain_seconds

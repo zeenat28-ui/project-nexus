@@ -1,0 +1,19 @@
+# Internal ClusterIP Service exposing ONLY the dedicated metrics/admin port (9090)
+# for Prometheus Operator ServiceMonitor scraping. Keep separate from the main
+# gateway Service and restrict access with NetworkPolicy + bearer token auth.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus-gateway-metrics
+  labels:
+    app.kubernetes.io/name: nexus-gateway
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nexus-gateway
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP

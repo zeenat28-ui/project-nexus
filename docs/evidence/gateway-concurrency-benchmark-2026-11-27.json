@@ -1,0 +1,73 @@
+{
+  "recorded_at_utc": "2026-11-27",
+  "nexus_version": "0.4.0",
+  "scope_note": "Live localhost TCP HTTP/1.1 gateway concurrency benchmark against the built-in MockBackend configured with 5.0 ms simulated upstream latency. Measures gateway ASGI/FastAPI request handling, auth, rate/concurrency limiting, SSE framing, and multi-tenant metering stability under concurrent load. Does NOT measure real GPU inference throughput; run `nexus load-test` against a staging GPU cluster for end-to-end GPU capacity planning.",
+  "environment": {
+    "os": "Windows-10-10.0.19045-SP0",
+    "python_version": "3.12.10",
+    "backend_type": "mock",
+    "simulated_backend_latency_ms": 5.0,
+    "auth_mode": "api_key",
+    "metering_enabled": true
+  },
+  "non_streaming_generate": {
+    "target_url": "http://127.0.0.1:18040",
+    "endpoint": "/v1/generate",
+    "stream": false,
+    "total_requests": 200,
+    "concurrency": 25,
+    "succeeded": 200,
+    "failed": 0,
+    "error_rate": 0.0,
+    "status_codes": {
+      "200": 200
+    },
+    "wall_time_seconds": 2.8069,
+    "requests_per_second": 71.25,
+    "latency_summary": {
+      "samples": 200,
+      "min_ms": 69.6,
+      "p50_ms": 207.24,
+      "p95_ms": 770.62,
+      "p99_ms": 1128.69,
+      "max_ms": 2202.41
+    },
+    "ttft_summary": null
+  },
+  "streaming_chat_completions": {
+    "target_url": "http://127.0.0.1:18040",
+    "endpoint": "/v1/chat/completions",
+    "stream": true,
+    "total_requests": 100,
+    "concurrency": 20,
+    "succeeded": 100,
+    "failed": 0,
+    "error_rate": 0.0,
+    "status_codes": {
+      "200": 100
+    },
+    "wall_time_seconds": 0.8839,
+    "requests_per_second": 113.14,
+    "latency_summary": {
+      "samples": 100,
+      "min_ms": 112.81,
+      "p50_ms": 142.09,
+      "p95_ms": 192.65,
+      "p99_ms": 200.8,
+      "max_ms": 202.48
+    },
+    "ttft_summary": {
+      "samples": 100,
+      "min_ms": 86.49,
+      "p50_ms": 105.26,
+      "p95_ms": 154.93,
+      "p99_ms": 162.58,
+      "max_ms": 166.23
+    }
+  },
+  "post_load_verification": {
+    "total_metered_requests": 300,
+    "secret_leakage_detected": false,
+    "in_flight_leaks_detected": false
+  }
+}

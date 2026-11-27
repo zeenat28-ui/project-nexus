@@ -175,7 +175,7 @@ class BackendSettings(BaseModel):
 
 
 class RoutingSettings(BaseModel):
-    """Multi-backend heterogeneous routing, scheduling strategy, and failover policy."""
+    """Multi-backend heterogeneous routing, scheduling strategy, telemetry poll, and failover."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -184,6 +184,7 @@ class RoutingSettings(BaseModel):
     strategy: RoutingStrategy = "priority"
     enable_failover: bool = False
     fallback_order: list[str] = Field(default_factory=list)
+    telemetry_poll_interval_seconds: float = Field(default=0.0, ge=0.0, le=300.0)
 
 
 class JWTAuthSettings(BaseModel):
@@ -283,14 +284,36 @@ class MeteringSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
+    backend: Literal["memory", "sqlite", "redis"] = "memory"
     window_seconds: int = Field(default=86_400, ge=60, le=2_592_000)
     sqlite_path: str | None = None
+    redis_url: SecretStr | None = None
+    redis_fail_open: bool = True
+    redis_timeout_seconds: float = Field(default=1.0, gt=0.0, le=10.0)
     default_prompt_cost_per_1k_usd: float = Field(default=0.0, ge=0.0)
     default_completion_cost_per_1k_usd: float = Field(default=0.0, ge=0.0)
     model_pricing: dict[str, ModelPricingSettings] = Field(default_factory=dict)
     default_max_tokens_per_window: int | None = Field(default=None, ge=1)
     default_max_cost_usd_per_window: float | None = Field(default=None, gt=0.0)
     tenants: dict[str, TenantQuotaSettings] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_metering_storage(self) -> MeteringSettings:
+        if self.backend == "sqlite" and not self.sqlite_path:
+            raise ValueError(
+                "metering.sqlite_path (or NEXUS_METERING_SQLITE_PATH) is required when "
+                "metering.backend='sqlite'"
+            )
+        if self.backend == "redis":
+            if self.redis_url is None:
+                raise ValueError(
+                    "metering.redis_url (or NEXUS_METERING_REDIS_URL) is required when "
+                    "metering.backend='redis'"
+                )
+            parsed = urlparse(self.redis_url.get_secret_value())
+            if parsed.scheme not in {"redis", "rediss"} or not parsed.netloc:
+                raise ValueError("metering.redis_url must be a valid redis:// or rediss:// URL")
+        return self
 
 
 class LimitsSettings(BaseModel):
@@ -448,7 +471,8 @@ class NexusSettings(BaseModel):
                 pool_list = [target] if isinstance(target, str) else target
                 if not pool_list:
                     raise ValueError(
-                        f"routing.model_routes[{model_id!r}] must specify at least one pool."
+                        f"routing.model_routes[{model_id!r}] must specify at least one "
+                        "backend pool."
                     )
                 for target_pool in pool_list:
                     if target_pool not in self.backends:
@@ -601,6 +625,11 @@ _ENV_MAPPINGS: tuple[
     ("NEXUS_ROUTING_DEFAULT_BACKEND", ("routing", "default_backend"), "str"),
     ("NEXUS_ROUTING_STRATEGY", ("routing", "strategy"), "str"),
     ("NEXUS_ROUTING_ENABLE_FAILOVER", ("routing", "enable_failover"), "bool"),
+    (
+        "NEXUS_ROUTING_TELEMETRY_POLL_INTERVAL_SECONDS",
+        ("routing", "telemetry_poll_interval_seconds"),
+        "float",
+    ),
     ("NEXUS_AUTH_MODE", ("auth", "mode"), "str"),
     ("NEXUS_AUTH_API_KEY", ("auth", "api_key"), "str"),
     ("NEXUS_AUTH_API_KEYS", ("auth", "api_keys"), "csv"),
@@ -609,8 +638,11 @@ _ENV_MAPPINGS: tuple[
     ("NEXUS_AUTH_JWT_ISSUER", ("auth", "jwt", "issuer"), "str"),
     ("NEXUS_AUTH_JWT_AUDIENCE", ("auth", "jwt", "audience"), "str"),
     ("NEXUS_METERING_ENABLED", ("metering", "enabled"), "bool"),
+    ("NEXUS_METERING_BACKEND", ("metering", "backend"), "str"),
     ("NEXUS_METERING_WINDOW_SECONDS", ("metering", "window_seconds"), "int"),
     ("NEXUS_METERING_SQLITE_PATH", ("metering", "sqlite_path"), "str"),
+    ("NEXUS_METERING_REDIS_URL", ("metering", "redis_url"), "str"),
+    ("NEXUS_METERING_REDIS_FAIL_OPEN", ("metering", "redis_fail_open"), "bool"),
     (
         "NEXUS_METERING_PROMPT_COST_PER_1K_USD",
         ("metering", "default_prompt_cost_per_1k_usd"),
@@ -669,6 +701,7 @@ _EMPTY_TO_NONE_PATHS: frozenset[tuple[str, ...]] = frozenset(
         ("backend", "metrics_path"),
         ("limits", "rate_limit_redis_url"),
         ("metering", "sqlite_path"),
+        ("metering", "redis_url"),
         ("metrics", "bearer_token"),
         ("metrics", "tls_cert_path"),
         ("metrics", "tls_key_path"),
