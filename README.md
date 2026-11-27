@@ -49,7 +49,7 @@ flowchart LR
 | Optional OpenTelemetry tracing (`[otel]`) with strict attribute allowlist | Implemented | Automated `InMemorySpanExporter` & W3C `traceparent` tests |
 | Prometheus metrics (separate default listener, bounded labels) | Implemented | Automated scrape & cardinality tests |
 | `nexus detect-gpu` (`nvidia-smi`, `amd-smi`, `rocm-smi`) & `nexus verify-backend` | Implemented | Automated mocked GPU & mock/transport backend verification tests |
-| Live external NVIDIA CUDA server (e.g. vLLM on CUDA) | Supported via `openai_compatible` | **Not verified on real NVIDIA hardware in this repo** |
+| Live external NVIDIA CUDA server (vLLM on NVIDIA Tesla T4) | Verified | Verified end-to-end on Colab NVIDIA Tesla T4 (`vLLM 0.34.0`, `CUDA 13.0`, `Qwen/Qwen2.5-1.5B-Instruct`): health, non-streaming, SSE streaming, auth, & metrics ([details](#nvidia-cuda-upstream-backend-verified-on-tesla-t4)) |
 | Live external AMD ROCm server (e.g. vLLM on ROCm) | Supported via `openai_compatible` | **Not verified on real AMD hardware in this repo** |
 | Mixed-vendor NVIDIA + AMD execution | Not supported | Explicitly unsupported |
 
@@ -164,12 +164,22 @@ nexus verify-backend --config <your-staging-config.yaml> --iterations 5
 
 `nexus detect-gpu` only reports a vendor as `available: true` when `nvidia-smi` (NVIDIA) or `amd-smi` / `rocm-smi` (AMD) executes cleanly and returns parseable device entries. Presence of `/opt/rocm` or `ROCM_PATH` alone is never treated as a verified GPU runtime.
 
-### NVIDIA CUDA Upstream Backend (Unverified on Hardware Here)
+### NVIDIA CUDA Upstream Backend (Verified on Tesla T4)
 
 - Upstream reference: [vLLM OpenAI-Compatible Server (CUDA)](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html)
-- Ready-to-run Colab verification notebook: [`notebooks/colab_cuda_verification.ipynb`](notebooks/colab_cuda_verification.ipynb) (runs on Google Colab NVIDIA T4 / L4 / A100 runtimes, starts vLLM CUDA with `Qwen/Qwen2.5-1.5B-Instruct`, and executes `nexus detect-gpu`, `nexus verify-backend`, and a live authenticated SSE gateway check).
-- Typical pairing: run a pinned vLLM CUDA release on your NVIDIA GPU host/node with `--host 127.0.0.1 --port 8001 --model <model-id>`, then configure Nexus with `backend.type: openai_compatible`, `backend.base_url: http://127.0.0.1:8001`, `backend.health_path: /health`, and validate with `nexus verify-backend`.
-- Hardware verification status: **Protocol integration (non-streaming + SSE streaming) is tested via `httpx.MockTransport`, and `nvidia-smi` parsing is unit-tested with mocked outputs; end-to-end execution on physical NVIDIA GPUs has not yet been recorded in this repository.**
+- Reproducible Colab verification notebook: [`notebooks/colab_cuda_verification.ipynb`](notebooks/colab_cuda_verification.ipynb)
+- Typical pairing: run a pinned vLLM CUDA release on your NVIDIA GPU host/node with `--host 127.0.0.1 --port 8001 --model <model-id>`, configure Nexus with `backend.type: openai_compatible`, `backend.base_url: http://127.0.0.1:8001`, `backend.health_path: /health`, and validate with `nexus verify-backend`.
+
+**Recorded single-GPU verification (2026-11-27, Google Colab Linux):**
+
+| Field | Verified Result |
+| --- | --- |
+| GPU & Driver | NVIDIA Tesla T4 (15,360 MiB), Driver `580.82.07`, detected via `nexus detect-gpu --json` |
+| Inference Stack | `vLLM 0.34.0`, `PyTorch 2.14.0+cu130`, `CUDA 13.0`, `Qwen/Qwen2.5-1.5B-Instruct` (`--dtype half --max-model-len 2048 --enforce-eager`) |
+| `nexus verify-backend` | `overall_passed: true` — `/health` `59.97 ms`; 5 non-streaming requests `min 238.37 ms`, `p50 242.30 ms`, `p95/max 1245.18 ms` (first-request warmup); SSE streaming `ttft 107.02 ms`, `total 316.48 ms` (6 chunks) |
+| Live Gateway E2E (`nexus serve`) | `/readyz` ready, `401` enforced on unauthenticated `/v1/models`, authenticated `/v1/generate` (`201.05 ms`), authenticated `/v1/chat/completions` (`stream: true` SSE + `[DONE]`), `:8000/metrics` `404`, `:9090/metrics` `200` with bearer token & zero prompt/request-ID leakage |
+
+> Scope caveat: this validates single-GPU NVIDIA Tesla T4 integration with vLLM; multi-GPU tensor parallelism, high-concurrency saturation benchmarks, and newer NVIDIA architectures (L4/A100/H100) should still be benchmarked in your target staging cluster.
 
 ### AMD ROCm Upstream Backend (Unverified on Hardware Here)
 
